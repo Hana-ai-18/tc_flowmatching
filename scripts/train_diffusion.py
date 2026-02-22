@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from TCNM.data.loader import data_loader
-from TCNM.diffusion_model import TCDiffusion
+from TCNM.flow_matching_model import TCDiffusion
 from TCNM.utils import get_cosine_schedule_with_warmup
 
 
