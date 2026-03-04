@@ -140,6 +140,8 @@ def compute_loss_breakdown(model, batch_list):
     smt_l  = model._smooth_loss(pred_x1)
     disp_l = model._weighted_disp_loss(pred_abs, traj_gt)
     curv_l = model._curvature_loss(pred_abs, traj_gt)
+    # Trong compute_loss_breakdown, sau khi tính curv_l:
+    print(f"DEBUG curv_raw={curv_l.item():.8f}")
     pinn_l = model._ns_pinn_loss(pred_abs)
 
     total = (fm_loss + 2.0*dir_l + 0.5*smt_l
