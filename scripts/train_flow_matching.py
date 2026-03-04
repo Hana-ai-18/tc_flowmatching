@@ -20,6 +20,7 @@ Chạy:
 
 import argparse, os, sys, time, math
 import torch, torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
