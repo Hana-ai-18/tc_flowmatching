@@ -54,7 +54,7 @@ def get_args():
     p.add_argument('--val_ensemble',        default=5,                           type=int)
     p.add_argument('--ode_steps',           default=10,                          type=int,
                    help='ODE integration steps cho Flow Matching')
-    p.add_argument('--val_freq',            default=5,                           type=int)
+    p.add_argument('--val_freq',            default=2,                           type=int)
     p.add_argument('--sigma_min',           default=0.001,                       type=float)
     # compat
     p.add_argument('--d_model',    default=128,   type=int)
