@@ -177,37 +177,43 @@ class TCFlowMatching(nn.Module):
 
     def _ns_pinn_loss(self, pred_abs):
         """
-        PINN Vorticity Equation Residual — Navier-Stokes thật.
-        ∂ζ/∂t + β·v_y = 0
+        PINN Vorticity Equation Residual — làm việc trong normalized units.
 
-        Tất cả tensors align về [T-3, B] để tránh shape mismatch:
-          v        [T-1, B, 2]  velocities
-          zeta     [T-2, B]     vorticity = cross(v[t+1], v[t])
-          dzeta_dt [T-3, B]     ∂ζ/∂t
-          beta     [T-3, B]     2Ω cos(φ)/R  tại lat pred_abs[2:-1]
-          v_y_ms   [T-3, B]     meridional vel v[1:-1]
+        Phương trình: ∂ζ/∂t + β·v_y = 0
+
+        Tất cả trong normalized units (không convert sang m/s):
+          v_norm    : displacement/step  (~0.05-0.3)
+          ζ_norm    : cross(v[t+1], v[t])  (~0.001-0.05)
+          ∂ζ/∂t     : (ζ[t+1]-ζ[t]) / 1step  (normalized, no DT division)
+          β_norm    : 2Ω cos(φ) * DT_6H  (per step, dimensionless ~1-3)
+          v_y_norm  : meridional velocity (normalized)
+
+        Residual² ~ 0.01-0.1 → cùng magnitude với fm_loss ✅
         """
         T = pred_abs.shape[0]
         if T < 4:
             return pred_abs.new_zeros(1).squeeze()
 
-        # Velocities [T-1, B, 2]
+        # Velocities [T-1, B, 2] — normalized units/step
         v = pred_abs[1:] - pred_abs[:-1]
 
-        # Vorticity [T-2, B]
+        # Vorticity [T-2, B] — normalized units²/step²
         zeta = (v[1:, :, 0] * v[:-1, :, 1]
               - v[1:, :, 1] * v[:-1, :, 0])
 
-        # dzeta_dt [T-3, B]
-        dzeta_dt = (zeta[1:] - zeta[:-1]) / DT_6H
+        # ∂ζ/∂t [T-3, B] — per step (không chia DT để giữ scale)
+        dzeta_dt = zeta[1:] - zeta[:-1]
 
-        # beta & v_y — cùng index [T-3, B]
-        lat_rad = torch.deg2rad(pred_abs[2:-1, :, 1] * 50.0)
-        beta    = 2 * OMEGA * lat_rad.cos() / R_EARTH
-        v_y_ms  = v[1:-1, :, 1] * NORM_TO_MS
+        # β_norm = 2Ω cos(φ) * DT_6H  [T-3, B] — dimensionless per step
+        lat_rad  = torch.deg2rad(pred_abs[2:-1, :, 1] * 50.0)
+        beta_n   = 2 * OMEGA * lat_rad.cos() * DT_6H   # ~1-3, dimensionless
 
-        # Residual
-        residual = (dzeta_dt + beta * v_y_ms) / (NORM_TO_MS ** 2 + 1e-10)
+        # v_y_norm [T-3, B]
+        v_y_n = v[1:-1, :, 1]
+
+        # Residual = ∂ζ/∂t + β_norm·v_y_norm  →  0 nếu thỏa mãn NS
+        residual = dzeta_dt + beta_n * v_y_n
+
         return (residual ** 2).mean()
 
     def get_loss(self, batch_list):
