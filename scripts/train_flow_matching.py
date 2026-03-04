@@ -100,11 +100,11 @@ def denorm_traj(n):
     return r
 
 
-# ── Loss breakdown (tính riêng từng thành phần để log) ───────────────────────
+# ── Loss breakdown (v4 — PINN vorticity) ─────────────────────────────────────
 def compute_loss_breakdown(model, batch_list):
     """
-    Tính loss và trả về dict breakdown để log.
-    Gọi trong no_grad() hoặc grad context tùy nơi dùng.
+    Breakdown loss để log từng thành phần.
+    Compatible với TCFlowMatching v4 (OT-CFM + PINN vorticity).
     """
     traj_gt = batch_list[1]
     Me_gt   = batch_list[8]
@@ -116,19 +116,21 @@ def compute_loss_breakdown(model, batch_list):
     lp, lm = obs[-1], obs_Me[-1]
     sm     = model.sigma_min
 
-    x1 = model.traj_to_rel(traj_gt, Me_gt, lp, lm)
-    x0 = torch.randn_like(x1) * sm
-    t  = torch.rand(B, device=device)
+    x1    = model.traj_to_rel(traj_gt, Me_gt, lp, lm)
+    x0    = torch.randn_like(x1) * sm
+    t     = torch.rand(B, device=device)
     t_exp = t.view(B, 1, 1)
 
-    x_t   = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
-    denom = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
+    # OT-CFM interpolation + target
+    x_t        = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
+    denom      = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
     target_vel = (x1 - (1 - sm) * x_t) / denom
 
-    pred_vel, ns_vel = model.net.forward_with_ns(x_t, t, batch_list)
+    # v4: dùng model.net.forward() bình thường (không có forward_with_ns)
+    pred_vel    = model.net(x_t, t, batch_list)
+    fm_loss     = F.mse_loss(pred_vel, target_vel)
 
-    fm_loss  = torch.nn.functional.mse_loss(pred_vel, target_vel)
-    pred_x1  = x_t + denom * pred_vel
+    pred_x1     = x_t + denom * pred_vel
     pred_abs, _ = model.rel_to_abs(pred_x1, lp, lm)
 
     dir_l  = model._dir_loss(pred_abs, traj_gt, lp)
@@ -136,16 +138,11 @@ def compute_loss_breakdown(model, batch_list):
     disp_l = model._weighted_disp_loss(pred_abs, traj_gt)
     curv_l = model._curvature_loss(pred_abs, traj_gt)
 
-    if obs.shape[0] >= 2:
-        obs_vel        = obs[-1] - obs[-2]
-        ns_loss        = torch.nn.functional.mse_loss(ns_vel, obs_vel)
-        ns_consistency = torch.nn.functional.mse_loss(pred_vel[:, 0, :2], ns_vel.detach())
-    else:
-        ns_loss        = x1.new_zeros(1).squeeze()
-        ns_consistency = x1.new_zeros(1).squeeze()
+    # PINN: vorticity equation residual (thay ns_loss của v3)
+    pinn_l = model._ns_pinn_loss(pred_abs)
 
-    total = (fm_loss + 2.0*dir_l + 0.5*smt_l + 1.0*disp_l
-             + 1.5*curv_l + 0.3*ns_loss + 0.2*ns_consistency)
+    total = (fm_loss + 2.0*dir_l + 0.5*smt_l
+             + 1.0*disp_l + 1.5*curv_l + 0.5*pinn_l)
 
     return {
         'total':   total,
@@ -154,8 +151,8 @@ def compute_loss_breakdown(model, batch_list):
         'smooth':  smt_l.item(),
         'disp':    disp_l.item(),
         'curv':    curv_l.item(),
-        'ns':      ns_loss.item(),
-        'ns_cons': ns_consistency.item(),
+        'ns':      pinn_l.item(),   # key 'ns' giữ để compat log CSV
+        'ns_cons': 0.0,
     }
 
 
@@ -354,7 +351,7 @@ def main(args):
                       f"  total={loss.item():.4f}"
                       f"  fm={bd['fm']:.3f}"
                       f"  dir={bd['dir']:.3f}"
-                      f"  ns={bd['ns']:.3f}"
+                      f"  pinn={bd['ns']:.4f}"
                       f"  lr={lr:.2e}")
 
         epoch_time    = time.time() - t_epoch_start
@@ -394,8 +391,7 @@ def main(args):
                       f"  dir={avg_breakdown['dir']:.3f}"
                       f"  disp={avg_breakdown['disp']:.3f}"
                       f"  curv={avg_breakdown['curv']:.3f}"
-                      f"  ns={avg_breakdown['ns']:.3f}"
-                      f"  ns_c={avg_breakdown['ns_cons']:.3f}")
+                      f"  pinn(NS)={avg_breakdown['ns']:.4f}")
                 print(f"  Track (km)     │"
                       f"  ADE={ade:.1f}  FDE={fde:.1f}"
                       f"  12h={m.get('12h',0):.0f}"
