@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from TCNM.data.loader import data_loader
-from TCNM.flow_matching_model import TCDiffusion
+from TCNM.flow_matching_model import TCFlowMatching
 from TCNM.utils import get_cosine_schedule_with_warmup
 
 
@@ -174,7 +174,7 @@ def main(args):
     print(f"  Train: {len(train_loader.dataset)} seq  "
           f"Val: {len(val_loader.dataset) if val_loader else 0} seq\n")
 
-    model = TCDiffusion(
+    model = TCFlowMatching(
         pred_len  = args.pred_len,
         obs_len   = args.obs_len,
         num_steps = args.num_diffusion_steps,
@@ -311,7 +311,7 @@ if __name__ == '__main__':
 # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # from TCNM.data.loader import data_loader
-# from TCNM.diffusion_model import TCDiffusion
+# from TCNM.diffusion_model import TCFlowMatching
 # from TCNM.utils import get_cosine_schedule_with_warmup
 
 

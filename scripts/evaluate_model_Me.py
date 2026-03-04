@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 
-from TCNM.diffusion_model import TCDiffusion
+from TCNM.flow_matching_model import TCFlowMatching
 from TCNM.data.loader import data_loader
 
 
@@ -79,7 +79,7 @@ def visualize_forecast(args):
         args.pred_len = pred_len
 
     # Load model
-    model = TCDiffusion(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
+    model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
     ck    = torch.load(args.model_path, map_location=device, weights_only=False)
     sd    = ck.get('model_state_dict', ck.get('model_state', ck))
     model.load_state_dict(sd)

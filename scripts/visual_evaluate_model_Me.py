@@ -428,7 +428,7 @@
 """
 scripts/visual_evaluate_model_Me.py
 ====================================
-TC-Diffusion 72h Forecast Visualisation  ── FIXED VERSION
+TC-FlowMatching 72h Forecast Visualisation  ── FIXED VERSION
 
 FIXES:
 1. Proper DDPM sampling (không dùng physics model đơn giản)
@@ -446,6 +446,8 @@ import argparse
 import numpy as np
 import torch
 import matplotlib
+
+from TCNM.flow_matching_model import TCFlowMatching
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import cv2
@@ -454,7 +456,7 @@ from datetime import datetime
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
 
-from TCNM.diffusion_model import TCDiffusion
+
 from TCNM.data.loader import data_loader
 from TCNM.data.trajectoriesWithMe_unet_training import seq_collate
 
@@ -576,7 +578,7 @@ def visualize_forecast(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print(f"{'='*65}")
-    print(f"  TC-Diffusion Forecast  |  {args.tc_name}  @  {args.tc_date}")
+    print(f"  TC-FlowMatching Forecast  |  {args.tc_name}  @  {args.tc_date}")
     print(f"{'='*65}\n")
 
     # ── Auto-detect pred_len ──────────────────────────────────────────────
@@ -586,7 +588,7 @@ def visualize_forecast(args):
         args.pred_len = detected
 
     # ── Load model ────────────────────────────────────────────────────────
-    model = TCDiffusion(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
+    model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
     ck    = torch.load(args.model_path, map_location=device, weights_only=False)
     sd      = ck.get('model_state_dict', ck.get('model_state', ck))
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -779,7 +781,7 @@ def visualize_forecast(args):
     last_e = errors_km[-1]
 
     ax.set_title(
-        f"🌀  {t_name}  –  {fh}h TC-Diffusion Forecast\n"
+        f"🌀  {t_name}  –  {fh}h TC-FlowMatching Forecast\n"
         f"📅  {dt_str}    │    Mean: {mean_e:.0f} km    │    {fh}h: {last_e:.0f} km",
         fontsize=17, fontweight='bold', color='white', pad=18,
         bbox=dict(boxstyle='round,pad=0.9', facecolor='#000000',
@@ -794,7 +796,7 @@ def visualize_forecast(args):
 
     # ── Info panel (lower-left) ───────────────────────────────────────────
     lines = [
-        "Model : TC-Diffusion (DDPM)",
+        "Model : TC-FlowMatching (DDPM)",
         f"Obs   : {args.obs_len} × 6h = {args.obs_len*6}h",
         f"Pred  : {args.pred_len} × 6h = {fh}h",
         f"Ref   : {ref_deg[0]:.1f}°E  {ref_deg[1]:.1f}°N",
@@ -835,7 +837,7 @@ def visualize_forecast(args):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description='TC-Diffusion Forecast Visualisation (FIXED)')
+    p = argparse.ArgumentParser(description='TC-FlowMatching Forecast Visualisation (FIXED)')
     p.add_argument('--model_path',    required=True,  help='Path to best_model.pth')
     p.add_argument('--TC_data_path',  required=True,  help='TCND_vn root directory')
     p.add_argument('--himawari_path', required=True,  help='Himawari image directory')
