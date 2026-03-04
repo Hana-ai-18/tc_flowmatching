@@ -1,20 +1,19 @@
 """
 scripts/train_flowmatching.py
 ==============================
-Training TCFlowMatching v3 với logging chi tiết để so sánh với Diffusion.
+Training TCFlowMatching v4 với OT-CFM + PINN Vorticity.
 
-So sánh metrics:
-  - ADE/FDE/24h/48h/72h (km) — giống diffusion
+Metrics:
+  - ADE/FDE/24h/48h/72h (km)
   - Train time per epoch (s)
   - Sample time per batch (ms)
-  - Loss breakdown: fm_loss, dir_loss, smooth_loss, disp_loss, curv_loss, ns_loss
-  - blend_w = 0.5 (không có, hiển thị N/A)
+  - Loss breakdown: fm, dir, smooth, disp, curv, pinn(NS)
 
 Chạy:
   python scripts/train_flowmatching.py \
       --dataset_root TCND_vn \
-      --output_dir   model_save/flowmatching_v3 \
-      --ddim_steps 10 --sigma_min 0.001 \
+      --output_dir   model_save/flowmatching_v4 \
+      --ode_steps 10 --sigma_min 0.001 \
       --num_epochs 200 --batch_size 32
 """
 
@@ -30,15 +29,7 @@ from TCNM.flow_matching_model import TCFlowMatching
 from TCNM.utils import get_cosine_schedule_with_warmup
 
 
-# ── Helper: không crash nếu model không có blend_logit ───────────────────────
-def get_blend_w(model):
-    if hasattr(model, 'denoiser') and hasattr(model.denoiser, 'blend_logit'):
-        return torch.sigmoid(model.denoiser.blend_logit).item()
-    if hasattr(model, 'net') and hasattr(model.net, 'blend_logit'):
-        return torch.sigmoid(model.net.blend_logit).item()
-    if hasattr(model, 'blend_logit'):
-        return torch.sigmoid(model.blend_logit).item()
-    return -1.0   # sentinel: N/A
+# blend_w không dùng trong Flow Matching
 
 
 def get_args():
@@ -46,7 +37,6 @@ def get_args():
     p.add_argument('--dataset_root',        default='TCND_vn',                  type=str)
     p.add_argument('--obs_len',             default=8,                           type=int)
     p.add_argument('--pred_len',            default=12,                          type=int)
-    p.add_argument('--num_diffusion_steps', default=100,                         type=int)
     p.add_argument('--batch_size',          default=32,                          type=int)
     p.add_argument('--num_epochs',          default=200,                         type=int)
     p.add_argument('--g_learning_rate',     default=2e-4,                        type=float)
@@ -59,8 +49,8 @@ def get_args():
     p.add_argument('--save_interval',       default=10,                          type=int)
     p.add_argument('--val_year',            default=2019,                        type=int)
     p.add_argument('--val_ensemble',        default=5,                           type=int)
-    p.add_argument('--ddim_steps',          default=10,                          type=int,
-                   help='ODE steps — OT-CFM chỉ cần 10 (Diffusion dùng 20)')
+    p.add_argument('--ode_steps',            default=10,                          type=int,
+                   help='ODE integration steps cho Flow Matching (10 là đủ)')
     p.add_argument('--val_freq',            default=5,                           type=int)
     p.add_argument('--sigma_min',           default=0.001,                       type=float)
     # compat
@@ -127,7 +117,7 @@ def compute_loss_breakdown(model, batch_list):
     denom      = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
     target_vel = (x1 - (1 - sm) * x_t) / denom
 
-    # v4: dùng model.net.forward() bình thường (không có forward_with_ns)
+    # Forward pass
     pred_vel    = model.net(x_t, t, batch_list)
     fm_loss     = F.mse_loss(pred_vel, target_vel)
 
@@ -245,11 +235,10 @@ def main(args):
 
     # ── Header ────────────────────────────────────────────────────────
     print("=" * 70)
-    print("  TC-FlowMatching v3  |  OT-CFM + Navier-Stokes Physics Prior")
+    print("  TC-FlowMatching v4  |  OT-CFM + PINN Vorticity (NS)")
     print("=" * 70)
     print(f"  Device      : {device}")
-    print(f"  ODE steps   : {args.ddim_steps}  "
-          f"(Diffusion dùng 20 DDIM steps → FM nhanh ~2x sampling)")
+    print(f"  ODE steps   : {args.ode_steps}")
     print(f"  sigma_min   : {args.sigma_min}  (OT path, near-deterministic)")
     print(f"  Ensemble    : {args.val_ensemble}")
     print(f"  LR          : {args.g_learning_rate}  WD: {args.weight_decay}")
@@ -271,13 +260,21 @@ def main(args):
     model = TCFlowMatching(
         pred_len  = args.pred_len,
         obs_len   = args.obs_len,
-        num_steps = args.num_diffusion_steps,
         sigma_min = args.sigma_min,
     ).to(device)
 
     n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters  : {n_p:,}")
-    print(f"  Architecture: VelocityField + NavierStokesPhysics\n")
+    print(f"  Architecture: VelocityField (OT-CFM + PINN Vorticity)\n")
+
+    # Kiểm tra đúng model v4
+    assert hasattr(model, "_ns_pinn_loss"), (
+        "❌ Model thiếu _ns_pinn_loss! Dùng flow_matching_model_v4.py"
+    )
+    assert not hasattr(model.net, "ns_physics"), (
+        "❌ Model vẫn dùng NavierStokesPhysics MLP (v3)! Dùng flow_matching_model_v4.py"
+    )
+    print("  ✅ PINN vorticity (NS) confirmed\n")
 
     # ── Optimizer ─────────────────────────────────────────────────────
     optimizer    = optim.AdamW(model.parameters(),
@@ -293,30 +290,9 @@ def main(args):
     with open(log_path, 'w') as f:
         # Cùng format với diffusion log + thêm cột cho FM
         f.write("epoch,train_loss,val_loss,ADE_km,FDE_km,"
-                "12h,24h,48h,72h,blend_w,"
+                "12h,24h,48h,72h,sigma_min,"
                 "epoch_time_s,sample_ms_per_batch,"
-                "fm_loss,dir_loss,smooth_loss,disp_loss,curv_loss,ns_loss,ns_cons\n")
-
-    # Comparison header
-    comp_path = os.path.join(args.output_dir, 'comparison_vs_diffusion.txt')
-    with open(comp_path, 'w') as f:
-        f.write("=" * 60 + "\n")
-        f.write("  FlowMatching v3 vs Diffusion v5 — Comparison Log\n")
-        f.write("=" * 60 + "\n")
-        f.write(f"  FM sigma_min  : {args.sigma_min}\n")
-        f.write(f"  FM ODE steps  : {args.ddim_steps}  (Diff: 20 DDIM)\n")
-        f.write(f"  FM ensemble   : {args.val_ensemble}\n")
-        f.write(f"  FM physics    : OT-CFM + Navier-Stokes\n")
-        f.write(f"  Diff physics  : DDIM + DirectRegression + blend\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"{'Epoch':>6} {'FM_ADE':>8} {'Diff_ADE':>10} "
-                f"{'FM_72h':>8} {'Diff_72h':>10} "
-                f"{'EpochTime':>10} {'SampleMs':>10}\n")
-        f.write("-" * 60 + "\n")
-
-    # Diffusion best ADE reference (từ training trước)
-    DIFF_BEST_ADE = 353.4   # epoch 80 từ training log trước
-    DIFF_72H      = None    # điền vào nếu có
+                "fm_loss,dir_loss,smooth_loss,disp_loss,curv_loss,pinn_loss,ns_cons\n")
 
     print("=" * 70 + "\n  TRAINING\n" + "=" * 70)
 
@@ -360,8 +336,8 @@ def main(args):
         avg_train     = train_loss / len(train_loader)
         n_bat         = len(train_loader)
         avg_breakdown = {k: v / n_bat for k, v in loss_accum.items()}
-        blend_w       = get_blend_w(model)
-        blend_str     = f"{blend_w:.3f}" if blend_w >= 0 else "N/A"
+        blend_w       = model.sigma_min   # OT-CFM sigma_min thay blend_w
+        blend_str     = f"{blend_w:.4f}"  # sigma_min
 
         # ── Validate ───────────────────────────────────────────────────
         if val_loader:
@@ -377,7 +353,7 @@ def main(args):
                 m, per_step = validate_km(
                     model, val_loader, device,
                     num_ensemble=args.val_ensemble,
-                    ddim_steps=args.ddim_steps,
+                    ddim_steps=args.ode_steps,
                     pred_len=args.pred_len,
                 )
                 ade = m['ADE']
@@ -404,14 +380,7 @@ def main(args):
                       f"  epoch={epoch_time:.1f}s"
                       f"  avg={sum(epoch_times)/len(epoch_times):.1f}s")
 
-                # So sánh với diffusion
-                delta_ade = ade - DIFF_BEST_ADE
-                sign      = "▲" if delta_ade > 0 else "▼"
-                print(f"  vs Diffusion   │"
-                      f"  Diff_best={DIFF_BEST_ADE:.1f}km"
-                      f"  FM={ade:.1f}km"
-                      f"  {sign}{abs(delta_ade):.1f}km"
-                      f"  ({'worse' if delta_ade > 0 else 'BETTER ✅'})")
+
                 print(f"{'─'*70}\n")
 
                 # Milestones
@@ -423,7 +392,7 @@ def main(args):
                     if ade < threshold:
                         print(f"  {msg} km"); break
 
-                # CSV log (compatible với diffusion log format)
+                # CSV log
                 with open(log_path, 'a') as f:
                     f.write(
                         f"{epoch},{avg_train:.6f},{avg_val:.6f},"
@@ -438,13 +407,6 @@ def main(args):
                         f"{avg_breakdown['ns_cons']:.4f}\n"
                     )
 
-                # Comparison log
-                with open(comp_path, 'a') as f:
-                    f.write(
-                        f"{epoch:>6} {ade:>8.1f} {DIFF_BEST_ADE:>10.1f} "
-                        f"{m.get('72h',0):>8.0f} {'N/A':>10} "
-                        f"{epoch_time:>10.1f} {sms:>10.1f}\n"
-                    )
 
                 saver(ade, model, args.output_dir, epoch,
                       optimizer, avg_train, avg_val)
@@ -481,25 +443,10 @@ def main(args):
     avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
     print(f"\n{'='*70}")
     print(f"  DONE")
-    print(f"  Best FM ADE     : {saver.best_ade:.1f} km")
-    print(f"  Diff best ADE   : {DIFF_BEST_ADE:.1f} km  (epoch 80)")
-    delta = saver.best_ade - DIFF_BEST_ADE
-    print(f"  Delta           : {'▲' if delta > 0 else '▼'}{abs(delta):.1f} km"
-          f"  ({'FM worse' if delta > 0 else 'FM BETTER ✅'})")
+    print(f"  Best ADE        : {saver.best_ade:.1f} km")
     print(f"  Avg epoch time  : {avg_epoch_time:.1f}s")
     print(f"  Log             : {log_path}")
-    print(f"  Comparison      : {comp_path}")
     print(f"{'='*70}\n")
-
-    # Final comparison file summary
-    with open(comp_path, 'a') as f:
-        f.write("\n" + "=" * 60 + "\n")
-        f.write(f"  SUMMARY\n")
-        f.write(f"  FM best ADE     : {saver.best_ade:.1f} km\n")
-        f.write(f"  Diffusion ADE   : {DIFF_BEST_ADE:.1f} km\n")
-        f.write(f"  Delta           : {delta:+.1f} km\n")
-        f.write(f"  Avg epoch time  : {avg_epoch_time:.1f}s\n")
-        f.write("=" * 60 + "\n")
 
 
 if __name__ == '__main__':
