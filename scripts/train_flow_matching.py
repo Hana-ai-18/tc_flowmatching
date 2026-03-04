@@ -141,7 +141,7 @@ def compute_loss_breakdown(model, batch_list):
     disp_l = model._weighted_disp_loss(pred_abs, traj_gt)
     curv_l = model._curvature_loss(pred_abs, traj_gt)
     # Trong compute_loss_breakdown, sau khi tính curv_l:
-    print(f"DEBUG curv_raw={curv_l.item():.8f}")
+    
     pinn_l = model._ns_pinn_loss(pred_abs)
 
     total = (fm_loss + 2.0*dir_l + 0.5*smt_l
@@ -400,7 +400,7 @@ def main(args):
                       f"  fm={avg_breakdown['fm']:.3f}"
                       f"  dir={avg_breakdown['dir']:.3f}"
                       f"  disp={avg_breakdown['disp']:.3f}"
-                      f"  curv={avg_breakdown['curv']:.3f}"
+                      f"  curv={avg_breakdown['curv']:.5f}"
                       f"  pinn(NS)={avg_breakdown['ns']:.4f}")
                 print(f"  Val (km)       │"
                       f"  ADE={ade:.1f}  FDE={fde:.1f}"
