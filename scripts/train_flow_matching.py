@@ -9,6 +9,11 @@ Metrics:
   - Sample time per batch (ms)
   - Loss breakdown: fm, dir, smooth, disp, curv, pinn(NS)
 
+Data split:
+  - train/  : training data
+  - val/    : validation (early stopping, best model selection)
+  - test/   : held-out test set (chỉ đánh giá cuối cùng, KHÔNG dùng để tune)
+
 Chạy:
   python scripts/train_flowmatching.py \
       --dataset_root TCND_vn \
@@ -29,9 +34,6 @@ from TCNM.flow_matching_model import TCFlowMatching
 from TCNM.utils import get_cosine_schedule_with_warmup
 
 
-# blend_w không dùng trong Flow Matching
-
-
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument('--dataset_root',        default='TCND_vn',                  type=str)
@@ -45,12 +47,13 @@ def get_args():
     p.add_argument('--grad_clip',           default=1.0,                         type=float)
     p.add_argument('--patience',            default=40,                          type=int)
     p.add_argument('--gpu_num',             default='0',                         type=str)
-    p.add_argument('--output_dir',          default='model_save/flowmatching_v3',type=str)
+    p.add_argument('--output_dir',          default='model_save/flowmatching_v4',type=str)
     p.add_argument('--save_interval',       default=10,                          type=int)
-    p.add_argument('--val_year',            default=2019,                        type=int)
+    p.add_argument('--test_year',           default=2019,                        type=int,
+                   help='Năm để filter test set (held-out, chỉ eval cuối)')
     p.add_argument('--val_ensemble',        default=5,                           type=int)
-    p.add_argument('--ode_steps',            default=10,                          type=int,
-                   help='ODE integration steps cho Flow Matching (10 là đủ)')
+    p.add_argument('--ode_steps',           default=10,                          type=int,
+                   help='ODE integration steps cho Flow Matching')
     p.add_argument('--val_freq',            default=5,                           type=int)
     p.add_argument('--sigma_min',           default=0.001,                       type=float)
     # compat
@@ -64,14 +67,29 @@ def get_args():
 
 
 def resolve_data_path(root):
+    """
+    Trả về (train_dir, val_dir, test_dir).
+
+    Ưu tiên dùng val/ folder riêng biệt.
+    Nếu không có val/, fallback về test/ (với cảnh báo).
+    """
     root = root.rstrip('/\\')
+
+    # Nếu truyền vào thẳng Data1d/train hoặc tương tự
     if root.endswith(('Data1d/train', 'Data1d\\train')):
-        return root, root[:-5] + 'test'
-    if root.endswith(('Data1d/test',  'Data1d\\test')):
-        return root[:-4] + 'train', root
-    if root.endswith('Data1d'):
-        return os.path.join(root, 'train'), os.path.join(root, 'test')
-    return os.path.join(root, 'Data1d', 'train'), os.path.join(root, 'Data1d', 'test')
+        base = root[:-len('train')]
+    elif root.endswith(('Data1d/test', 'Data1d\\test')):
+        base = root[:-len('test')]
+    elif root.endswith('Data1d'):
+        base = root + os.sep
+    else:
+        base = os.path.join(root, 'Data1d') + os.sep
+
+    train_dir = os.path.join(base, 'train')
+    val_dir   = os.path.join(base, 'val')
+    test_dir  = os.path.join(base, 'test')
+
+    return train_dir, val_dir, test_dir
 
 
 def move_batch(bl, device):
@@ -91,12 +109,8 @@ def denorm_traj(n):
     return r
 
 
-# ── Loss breakdown (v4 — PINN vorticity) ─────────────────────────────────────
+# ── Loss breakdown ────────────────────────────────────────────────────────────
 def compute_loss_breakdown(model, batch_list):
-    """
-    Breakdown loss để log từng thành phần.
-    Compatible với TCFlowMatching v4 (OT-CFM + PINN vorticity).
-    """
     traj_gt = batch_list[1]
     Me_gt   = batch_list[8]
     obs     = batch_list[0]
@@ -112,12 +126,10 @@ def compute_loss_breakdown(model, batch_list):
     t     = torch.rand(B, device=device)
     t_exp = t.view(B, 1, 1)
 
-    # OT-CFM interpolation + target
     x_t        = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
     denom      = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
     target_vel = (x1 - (1 - sm) * x_t) / denom
 
-    # Forward pass
     pred_vel    = model.net(x_t, t, batch_list)
     fm_loss     = F.mse_loss(pred_vel, target_vel)
 
@@ -128,8 +140,6 @@ def compute_loss_breakdown(model, batch_list):
     smt_l  = model._smooth_loss(pred_x1)
     disp_l = model._weighted_disp_loss(pred_abs, traj_gt)
     curv_l = model._curvature_loss(pred_abs, traj_gt)
-
-    # PINN: vorticity equation residual (thay ns_loss của v3)
     pinn_l = model._ns_pinn_loss(pred_abs)
 
     total = (fm_loss + 2.0*dir_l + 0.5*smt_l
@@ -142,13 +152,13 @@ def compute_loss_breakdown(model, batch_list):
         'smooth':  smt_l.item(),
         'disp':    disp_l.item(),
         'curv':    curv_l.item(),
-        'ns':      pinn_l.item(),   # key 'ns' giữ để compat log CSV
+        'ns':      pinn_l.item(),
         'ns_cons': 0.0,
     }
 
 
-# ── Validation ────────────────────────────────────────────────────────────────
-def validate_km(model, loader, device, num_ensemble=5,
+# ── Validation / Test metrics ─────────────────────────────────────────────────
+def evaluate_km(model, loader, device, num_ensemble=5,
                 ddim_steps=10, pred_len=12):
     model.eval()
     all_step_errors = []
@@ -205,7 +215,7 @@ class BestModelSaver:
                 'train_loss':       train_loss,
                 'val_loss':         val_loss,
                 'val_ade_km':       ade_km,
-                'model_type':       'TCFlowMatching_v3_OT-CFM+NS',
+                'model_type':       'TCFlowMatching_v4_OT-CFM+PINN',
                 'args': {
                     'obs_len':   model.obs_len,
                     'pred_len':  model.pred_len,
@@ -213,12 +223,12 @@ class BestModelSaver:
                 },
             }, ckpt)
             if self.verbose:
-                print(f"  ✅ Best ADE: {ade_km:.1f} km  →  saved {ckpt}")
+                print(f"  ✅ Best val ADE: {ade_km:.1f} km  →  saved {ckpt}")
         else:
             self.counter += 1
             if self.verbose:
                 print(f"  EarlyStopping: {self.counter}/{self.patience}  "
-                      f"(best={self.best_ade:.1f} km)")
+                      f"(best val ADE={self.best_ade:.1f} km)")
             if self.counter >= self.patience:
                 self.early_stop = True
 
@@ -246,15 +256,40 @@ def main(args):
     print("=" * 70)
 
     # ── Data ──────────────────────────────────────────────────────────
-    train_dir, test_dir = resolve_data_path(args.dataset_root)
-    _, train_loader = data_loader(args, {'root': train_dir, 'type': 'train'}, test=False)
-    val_loader = None
-    if os.path.exists(test_dir):
-        _, val_loader = data_loader(args, {'root': test_dir, 'type': 'test'},
-                                    test=True, test_year=args.val_year)
+    train_dir, val_dir, test_dir = resolve_data_path(args.dataset_root)
 
-    print(f"  Train: {len(train_loader.dataset)} seq  "
-          f"Val: {len(val_loader.dataset) if val_loader else 0} seq\n")
+    print(f"\n  Data paths:")
+    print(f"    train : {train_dir}")
+    print(f"    val   : {val_dir}")
+    print(f"    test  : {test_dir}  (held-out, year={args.test_year})")
+
+    _, train_loader = data_loader(args, {'root': train_dir, 'type': 'train'}, test=False)
+
+    # ── Val loader: dùng val/ folder, KHÔNG filter theo year ──────────
+    val_loader = None
+    if os.path.exists(val_dir):
+        _, val_loader = data_loader(args, {'root': val_dir, 'type': 'val'}, test=True)
+        print(f"\n  ✅ Val loader: val/ folder  ({len(val_loader.dataset)} seq)")
+    else:
+        # Fallback: nếu không có val/ thì dùng test/ (cảnh báo)
+        print(f"\n  ⚠️  val/ folder không tồn tại! Fallback về test/ (không lý tưởng)")
+        if os.path.exists(test_dir):
+            _, val_loader = data_loader(args, {'root': test_dir, 'type': 'test'},
+                                        test=True, test_year=args.test_year)
+            print(f"  ⚠️  Dùng test/ year={args.test_year} làm val  ({len(val_loader.dataset)} seq)")
+
+    # ── Test loader: held-out, chỉ eval cuối training ─────────────────
+    test_loader = None
+    if os.path.exists(test_dir):
+        _, test_loader = data_loader(args, {'root': test_dir, 'type': 'test'},
+                                     test=True, test_year=args.test_year)
+        print(f"  ✅ Test loader: test/ year={args.test_year}  ({len(test_loader.dataset)} seq)")
+    else:
+        print(f"  ⚠️  test/ folder không tồn tại, bỏ qua final test eval")
+
+    print(f"\n  Train: {len(train_loader.dataset)} seq  "
+          f"Val: {len(val_loader.dataset) if val_loader else 0} seq  "
+          f"Test: {len(test_loader.dataset) if test_loader else 0} seq\n")
 
     # ── Model ─────────────────────────────────────────────────────────
     model = TCFlowMatching(
@@ -267,7 +302,6 @@ def main(args):
     print(f"  Parameters  : {n_p:,}")
     print(f"  Architecture: VelocityField (OT-CFM + PINN Vorticity)\n")
 
-    # Kiểm tra đúng model v4
     assert hasattr(model, "_ns_pinn_loss"), (
         "❌ Model thiếu _ns_pinn_loss! Dùng flow_matching_model_v4.py"
     )
@@ -288,9 +322,8 @@ def main(args):
     # ── Log files ─────────────────────────────────────────────────────
     log_path = os.path.join(args.output_dir, 'training_log.csv')
     with open(log_path, 'w') as f:
-        # Cùng format với diffusion log + thêm cột cho FM
-        f.write("epoch,train_loss,val_loss,ADE_km,FDE_km,"
-                "12h,24h,48h,72h,sigma_min,"
+        f.write("epoch,train_loss,val_loss,val_ADE_km,val_FDE_km,"
+                "val_12h,val_24h,val_48h,val_72h,sigma_min,"
                 "epoch_time_s,sample_ms_per_batch,"
                 "fm_loss,dir_loss,smooth_loss,disp_loss,curv_loss,pinn_loss,ns_cons\n")
 
@@ -308,9 +341,9 @@ def main(args):
         t_epoch_start = time.time()
 
         for i, batch in enumerate(train_loader):
-            bl     = move_batch(list(batch), device)
-            bd     = compute_loss_breakdown(model, bl)
-            loss   = bd['total']
+            bl   = move_batch(list(batch), device)
+            bd   = compute_loss_breakdown(model, bl)
+            loss = bd['total']
 
             optimizer.zero_grad()
             loss.backward()
@@ -336,10 +369,8 @@ def main(args):
         avg_train     = train_loss / len(train_loader)
         n_bat         = len(train_loader)
         avg_breakdown = {k: v / n_bat for k, v in loss_accum.items()}
-        blend_w       = model.sigma_min   # OT-CFM sigma_min thay blend_w
-        blend_str     = f"{blend_w:.4f}"  # sigma_min
 
-        # ── Validate ───────────────────────────────────────────────────
+        # ── Validate trên val/ ─────────────────────────────────────────
         if val_loader:
             model.eval()
             val_loss = 0.0
@@ -350,7 +381,7 @@ def main(args):
             avg_val = val_loss / len(val_loader)
 
             if epoch % args.val_freq == 0 or epoch < 5:
-                m, per_step = validate_km(
+                m, per_step = evaluate_km(
                     model, val_loader, device,
                     num_ensemble=args.val_ensemble,
                     ddim_steps=args.ode_steps,
@@ -369,7 +400,7 @@ def main(args):
                       f"  disp={avg_breakdown['disp']:.3f}"
                       f"  curv={avg_breakdown['curv']:.3f}"
                       f"  pinn(NS)={avg_breakdown['ns']:.4f}")
-                print(f"  Track (km)     │"
+                print(f"  Val (km)       │"
                       f"  ADE={ade:.1f}  FDE={fde:.1f}"
                       f"  12h={m.get('12h',0):.0f}"
                       f"  24h={m.get('24h',0):.0f}"
@@ -379,27 +410,23 @@ def main(args):
                       f"  sample={sms:.1f}ms/batch"
                       f"  epoch={epoch_time:.1f}s"
                       f"  avg={sum(epoch_times)/len(epoch_times):.1f}s")
-
-
                 print(f"{'─'*70}\n")
 
-                # Milestones
                 for threshold, msg in [
                     (500, '📉 ADE<500'), (300, '📉 ADE<300'),
                     (200, '🎯 ADE<200'), (150, '🏆 ADE<150'),
-                    (100, '🌟 ADE<100!'), (50,  '🔥 ADE<50km!!!')
+                    (100, '🌟 ADE<100!'), (50, '🔥 ADE<50km!!!')
                 ]:
                     if ade < threshold:
                         print(f"  {msg} km"); break
 
-                # CSV log
                 with open(log_path, 'a') as f:
                     f.write(
                         f"{epoch},{avg_train:.6f},{avg_val:.6f},"
                         f"{ade:.1f},{fde:.1f},"
                         f"{m.get('12h',0):.1f},{m.get('24h',0):.1f},"
                         f"{m.get('48h',0):.1f},{m.get('72h',0):.1f},"
-                        f"{blend_str},"
+                        f"{args.sigma_min:.4f},"
                         f"{epoch_time:.1f},{sms:.1f},"
                         f"{avg_breakdown['fm']:.4f},{avg_breakdown['dir']:.4f},"
                         f"{avg_breakdown['smooth']:.4f},{avg_breakdown['disp']:.4f},"
@@ -407,7 +434,7 @@ def main(args):
                         f"{avg_breakdown['ns_cons']:.4f}\n"
                     )
 
-
+                # Early stopping + best model dựa trên val ADE
                 saver(ade, model, args.output_dir, epoch,
                       optimizer, avg_train, avg_val)
 
@@ -418,7 +445,7 @@ def main(args):
                     f.write(
                         f"{epoch},{avg_train:.6f},{avg_val:.6f},"
                         f",,,,,,"
-                        f"{blend_str},"
+                        f"{args.sigma_min:.4f},"
                         f"{epoch_time:.1f},,"
                         f"{avg_breakdown['fm']:.4f},{avg_breakdown['dir']:.4f},"
                         f"{avg_breakdown['smooth']:.4f},{avg_breakdown['disp']:.4f},"
@@ -427,7 +454,7 @@ def main(args):
                     )
 
             if saver.early_stop:
-                print("  Early stopping."); break
+                print("  Early stopping triggered."); break
 
         else:
             print(f"\n  Epoch {epoch:>3}  │  train={avg_train:.4f}"
@@ -439,13 +466,53 @@ def main(args):
                         'model_state_dict': model.state_dict()}, ckpt)
             print(f"  ✓ Checkpoint → {ckpt}\n")
 
-    # ── Final summary ─────────────────────────────────────────────────
+    # ── Final eval trên test/ (held-out) ──────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"  FINAL TEST EVALUATION  (held-out, year={args.test_year})")
+    print(f"{'='*70}")
+
+    if test_loader:
+        # Load best model
+        best_ckpt = os.path.join(args.output_dir, 'best_model.pth')
+        if os.path.exists(best_ckpt):
+            ckpt_data = torch.load(best_ckpt, map_location=device)
+            model.load_state_dict(ckpt_data['model_state_dict'])
+            print(f"  Loaded best model from epoch {ckpt_data['epoch']}"
+                  f"  (val ADE={ckpt_data['val_ade_km']:.1f} km)")
+
+        test_m, _ = evaluate_km(
+            model, test_loader, device,
+            num_ensemble=args.val_ensemble,
+            ddim_steps=args.ode_steps,
+            pred_len=args.pred_len,
+        )
+        print(f"\n  Test (km) │"
+              f"  ADE={test_m['ADE']:.1f}  FDE={test_m['FDE']:.1f}"
+              f"  12h={test_m.get('12h',0):.0f}"
+              f"  24h={test_m.get('24h',0):.0f}"
+              f"  48h={test_m.get('48h',0):.0f}"
+              f"  72h={test_m.get('72h',0):.0f}")
+
+        # Ghi test results ra file riêng
+        test_log = os.path.join(args.output_dir, 'test_results.txt')
+        with open(test_log, 'w') as f:
+            f.write(f"Test year : {args.test_year}\n")
+            f.write(f"ADE (km)  : {test_m['ADE']:.1f}\n")
+            f.write(f"FDE (km)  : {test_m['FDE']:.1f}\n")
+            f.write(f"12h (km)  : {test_m.get('12h',0):.1f}\n")
+            f.write(f"24h (km)  : {test_m.get('24h',0):.1f}\n")
+            f.write(f"48h (km)  : {test_m.get('48h',0):.1f}\n")
+            f.write(f"72h (km)  : {test_m.get('72h',0):.1f}\n")
+        print(f"\n  Test results → {test_log}")
+    else:
+        print("  ⚠️  Không có test loader, bỏ qua.")
+
     avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
     print(f"\n{'='*70}")
     print(f"  DONE")
-    print(f"  Best ADE        : {saver.best_ade:.1f} km")
+    print(f"  Best val ADE    : {saver.best_ade:.1f} km")
     print(f"  Avg epoch time  : {avg_epoch_time:.1f}s")
-    print(f"  Log             : {log_path}")
+    print(f"  Train log       : {log_path}")
     print(f"{'='*70}\n")
 
 
