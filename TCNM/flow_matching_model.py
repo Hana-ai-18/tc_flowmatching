@@ -446,56 +446,36 @@ class TCFlowMatching(nn.Module):
     def _ns_pinn_loss(self, pred_abs):
         """
         PINN Vorticity Equation Residual — Navier-Stokes thật.
+        ∂ζ/∂t + β·v_y = 0
 
-        Phương trình vorticity cho large-scale TC motion:
-            ∂ζ/∂t + V·∇(ζ + f) = 0
-
-        Discretize:
-            ζ[t]   = cross(v[t+1], v[t])        relative vorticity
-            ∂ζ/∂t  ≈ (ζ[t+1] - ζ[t]) / Δt
-            V·∇f   ≈ β * v_y                     beta drift (dominant)
-            β      = 2Ω cos(φ) / R               gradient of Coriolis
-
-        Residual = ∂ζ/∂t + β * v_y → 0 nếu track thỏa mãn NS
-
-        pred_abs: [T, B, 2] — absolute trajectory (normalized units)
+        Tất cả tensors align về [T-3, B] để tránh shape mismatch:
+          v        [T-1, B, 2]  velocities
+          zeta     [T-2, B]     vorticity = cross(v[t+1], v[t])
+          dzeta_dt [T-3, B]     ∂ζ/∂t
+          beta     [T-3, B]     2Ω cos(φ)/R  tại lat pred_abs[2:-1]
+          v_y_ms   [T-3, B]     meridional vel v[1:-1]
         """
-        if pred_abs.shape[0] < 4:
+        T = pred_abs.shape[0]
+        if T < 4:
             return pred_abs.new_zeros(1).squeeze()
 
-        # Velocity vectors [T-1, B, 2] (normalized units/step)
-        v = pred_abs[1:] - pred_abs[:-1]                   # [T-1, B, 2]
+        # Velocities [T-1, B, 2]
+        v = pred_abs[1:] - pred_abs[:-1]
 
-        # Latitude: pred_abs[:, :, 1] normalized → degrees
-        # norm: lat_norm = lat_deg / 50  →  lat_deg = lat_norm * 50
-        lat_deg = pred_abs[:-2, :, 1] * 50.0               # [T-2, B] degrees
-        lat_rad = torch.deg2rad(lat_deg)
+        # Vorticity [T-2, B]
+        zeta = (v[1:, :, 0] * v[:-1, :, 1]
+              - v[1:, :, 1] * v[:-1, :, 0])
 
-        # Coriolis: f = 2Ω sin(φ)
-        # f_val = 2 * OMEGA * lat_rad.sin()                # [T-2, B]
-
-        # Beta = df/dy = 2Ω cos(φ) / R  [1/(m·s)]
-        beta = 2 * OMEGA * lat_rad.cos() / R_EARTH         # [T-2, B]
-
-        # Relative vorticity ζ = cross product of consecutive velocities
-        # ζ[t] = v_x[t+1]*v_y[t] - v_y[t+1]*v_x[t]      [T-2, B]
-        zeta = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
-
-        # ∂ζ/∂t ≈ (ζ[t+1] - ζ[t]) / Δt                  [T-3, B]
+        # dzeta_dt [T-3, B]
         dzeta_dt = (zeta[1:] - zeta[:-1]) / DT_6H
 
-        # v_y (meridional velocity) → convert to m/s
-        v_y_ms = v[:-2, :, 1] * NORM_TO_MS                # [T-2, B] → m/s
+        # beta & v_y — cùng index [T-3, B]
+        lat_rad = torch.deg2rad(pred_abs[2:-1, :, 1] * 50.0)
+        beta    = 2 * OMEGA * lat_rad.cos() / R_EARTH
+        v_y_ms  = v[1:-1, :, 1] * NORM_TO_MS
 
-        # Beta drift: V·∇f ≈ β * v_y
-        beta_drift = beta[:-1] * v_y_ms[1:]               # [T-3, B]
-
-        # Vorticity residual: ∂ζ/∂t + β*v_y = 0
-        residual = dzeta_dt + beta_drift                   # [T-3, B]
-
-        # Normalize residual để scale không quá lớn
-        residual = residual / (NORM_TO_MS ** 2 + 1e-10)
-
+        # Residual
+        residual = (dzeta_dt + beta * v_y_ms) / (NORM_TO_MS ** 2 + 1e-10)
         return (residual ** 2).mean()
 
     def get_loss(self, batch_list):
