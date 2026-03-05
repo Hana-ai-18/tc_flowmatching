@@ -152,10 +152,16 @@ class TCFlowMatching(nn.Module):
     # ── FIX 2: Step-wise direction loss ───────────────────────────────────────
     def _dir_loss(self, pred_abs, gt_abs, last_pos):
         """
-        v5: kết hợp overall direction loss + step-wise direction loss.
+        v5.1: overall direction loss + step-wise direction loss với norm guard.
 
-        Overall: so hướng tổng thể pred vs gt từ last_pos
-        Step-wise: so hướng velocity từng bước → phạt nặng khi sai hướng di chuyển
+        Bug v5.0: F.normalize(near-zero vector) → unstable gradient
+                  model tìm shortcut minimize cosine sim mà không predict đúng hướng
+                  → dir_loss collapse về 0 nhưng ADE không cải thiện
+
+        Fix v5.1:
+          - clamp norm trước khi normalize (tránh division by ~0)
+          - mask: chỉ tính loss ở bước gt di chuyển đáng kể (norm > 0.01)
+          - giảm step_dir weight 2.0 → 1.0 (tránh overfit direction)
         """
         # Overall direction (giữ từ v4)
         ref = last_pos.unsqueeze(0)
@@ -165,19 +171,23 @@ class TCFlowMatching(nn.Module):
             min=0
         ).mean()
 
-        # Step-wise direction: so velocity từng bước
+        # Step-wise direction với norm guard
         if pred_abs.shape[0] >= 2:
-            pred_v = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
-            gt_v   = gt_abs[1:]   - gt_abs[:-1]     # [T-1, B, 2]
-            # Cosine similarity giữa pred velocity và gt velocity
-            cos_sim = (F.normalize(pred_v, dim=-1) *
-                       F.normalize(gt_v,   dim=-1)).sum(-1)  # [T-1, B]
-            # Phạt khi cos < 0.5 (sai hướng > 60°)
-            step_dir = F.relu(0.5 - cos_sim).mean()
+            pred_v = pred_abs[1:] - pred_abs[:-1]          # [T-1, B, 2]
+            gt_v   = gt_abs[1:]   - gt_abs[:-1]            # [T-1, B, 2]
+
+            # clamp norm để tránh normalize vector gần 0 → gradient nhiễu
+            pred_norm = pred_v.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+            gt_norm   = gt_v.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+            cos_sim   = ((pred_v / pred_norm) * (gt_v / gt_norm)).sum(-1)  # [T-1, B]
+
+            # Chỉ phạt ở bước gt thực sự di chuyển đáng kể
+            mask     = (gt_v.norm(dim=-1) > 0.01).float()  # [T-1, B]
+            step_dir = (F.relu(0.5 - cos_sim) * mask).sum() / (mask.sum() + 1e-6)
         else:
             step_dir = pred_abs.new_zeros(1).squeeze()
 
-        return overall + 2.0 * step_dir   # step_dir weight cao hơn
+        return overall + 1.0 * step_dir   # giảm từ 2.0 → 1.0
 
     def _smooth_loss(self, traj_abs):
         """
