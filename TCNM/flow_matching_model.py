@@ -1,37 +1,34 @@
 """
-TCNM/flow_matching_model.py  ── v4  OT-CFM + PINN Vorticity (NS thật)
+TCNM/flow_matching_model.py  ── v5  OT-CFM + PINN + Absolute Trajectory
 =========================================================================
 
-UPGRADES vs v3:
-1. Giữ nguyên hoàn toàn:
-   - Unet3D, Env_net, LSTM (context extraction)
-   - traj_to_rel / rel_to_abs
-   - dir_loss, curvature_loss, weighted_disp_loss
-   - OT-CFM training + Euler ODE sampling
+ROOT CAUSE của straight-line prediction:
+  v4 dùng cumulative displacement (cumsum) → model chỉ cần học
+  "mỗi bước đi bao xa theo hướng hiện tại" → extrapolate thẳng là tối ưu.
+  Với recurvature, bão đổi hướng đột ngột — displacement thay đổi hoàn toàn
+  nhưng model không có signal để dự đoán điều đó.
 
-2. Thêm PINN (Physics-Informed Neural Network) — NS thật:
-   - Vorticity equation: ∂ζ/∂t + V·∇(ζ+f) = 0
-   - ζ = relative vorticity (cross product of velocities)
-   - f = 2Ω sin(φ)  — Coriolis (tính từ latitude thật)
-   - β = 2Ω cos(φ)/R  — beta effect (gradient of f)
-   - Beta drift: TC tự di chuyển về phía cực do gradient f
-   - Residual → 0 nghĩa là predicted track thỏa mãn NS
-   - Đây là PINN thật, không phải MLP giả vờ NS
+FIXES vs v4:
+──────────────────────────────────────────────────────────────────────────
+FIX 1 │ traj_to_rel: cumulative displacement → absolute offset từ last_pos
+       │ - v4: x1[t] = Σ displacement[0..t]  → mỗi step tích lũy sai số
+       │ - v5: x1[t] = pos[t] - last_pos     → model học hình dạng toàn
+       │   bộ trajectory, recurvature là 1 pattern shape có thể học được
+       │ - rel_to_abs: bỏ cumsum, chỉ cộng offset vào last_pos
+──────────────────────────────────────────────────────────────────────────
+FIX 2 │ _dir_loss: thêm step-wise direction loss
+       │ - v4: chỉ so hướng tổng thể pred vs gt từ last_pos
+       │   → không phạt khi đúng hướng đầu nhưng sai hướng sau recurvature
+       │ - v5: so cosine(pred_velocity[t], gt_velocity[t]) từng bước
+       │   → phạt nặng khi hướng di chuyển từng bước sai > 60°
+──────────────────────────────────────────────────────────────────────────
+FIX 3 │ _smooth_loss: tính trên velocity/acceleration của abs trajectory
+       │ - v4: tính trên rel tensor [B,T,4] → đo smoothness của displacement
+       │ - v5: tính acceleration = Δvelocity → phạt đổi hướng ĐỘT NGỘT
+       │   (không phạt recurvature dần dần, chỉ phạt noise/jitter)
+──────────────────────────────────────────────────────────────────────────
 
-3. Bỏ NavierStokesPhysics MLP (v3) — thay bằng physics equation thật
-   → Không thêm parameters, chỉ thêm physics constraint vào loss
-
-PINN vorticity equation:
-  ∂ζ/∂t ≈ (ζ[t+1] - ζ[t]) / Δt
-  V·∇(ζ+f) ≈ β * v_y   (dominant term cho TC scale)
-  Residual = ∂ζ/∂t + β * v_y
-  L_PINN = mean(Residual²)
-
-Tại sao tốt hơn v3:
-  - v3: MLP(env_feature) → steering_vel  [chỉ là regression]
-  - v4: ép predicted track thỏa mãn vorticity equation thật
-  - Model bị buộc học: bão đổi hướng theo Coriolis + beta drift
-  - Generalize tốt hơn vì physics universal (không phụ thuộc dataset)
+Giữ nguyên: VelocityField, OT-CFM training, PINN vorticity, sampling
 """
 import math
 import torch
@@ -42,12 +39,10 @@ from TCNM.env_net_transformer_gphsplit import Env_net
 
 
 # ── Physical constants ────────────────────────────────────────────────────────
-OMEGA     = 7.2921e-5   # Earth rotation rate (rad/s)
-R_EARTH   = 6.371e6     # Earth radius (m)
-DT_6H     = 6 * 3600    # 6 hours in seconds (1 step = 6h)
-# Normalization: 1 unit = 50 × 0.1° × 111km/° ≈ 555km
-# Velocity: 1 unit/step ≈ 555km / 6h ≈ 25.7 m/s
-NORM_TO_MS = 555e3 / DT_6H   # convert normalized vel → m/s
+OMEGA      = 7.2921e-5
+R_EARTH    = 6.371e6
+DT_6H      = 6 * 3600
+NORM_TO_MS = 555e3 / DT_6H
 
 
 # ── Velocity Field Network ────────────────────────────────────────────────────
@@ -67,8 +62,6 @@ class VelocityField(nn.Module):
         self.ctx_ln       = nn.LayerNorm(512)
         self.ctx_drop     = nn.Dropout(0.15)
         self.ctx_fc2      = nn.Linear(512, ctx_dim)
-
-        # PINN v4: bỏ ns_physics MLP, thay bằng physics equation trong loss
 
         self.time_fc1   = nn.Linear(128, 256)
         self.time_fc2   = nn.Linear(256, 128)
@@ -112,7 +105,7 @@ class VelocityField(nn.Module):
         ctx = F.gelu(self.ctx_ln(self.ctx_fc1(ctx)))
         ctx = self.ctx_drop(ctx)
         ctx = self.ctx_fc2(ctx)
-        return ctx   # [B, ctx_dim]
+        return ctx
 
     def forward(self, x_t, t, batch_list):
         ctx   = self._extract_context(batch_list)
@@ -134,31 +127,70 @@ class TCFlowMatching(nn.Module):
         self.sigma_min = sigma_min
         self.net       = VelocityField(pred_len, obs_len, sigma_min=sigma_min)
 
+    # ── FIX 1: Absolute offset thay vì cumulative displacement ────────────────
     @staticmethod
     def traj_to_rel(traj_gt, Me_gt, last_pos, last_Me):
-        tf = torch.cat([last_pos.unsqueeze(0), traj_gt], dim=0)
-        mf = torch.cat([last_Me.unsqueeze(0),  Me_gt],   dim=0)
-        return torch.cat([tf[1:]-tf[:-1], mf[1:]-mf[:-1]], dim=-1).permute(1, 0, 2)
+        """
+        v5: encode trajectory as absolute offset from last observed position.
+        Model học hình dạng toàn bộ trajectory → học được recurvature.
+
+        v4 cũ: cumulative displacement → model extrapolate thẳng
+        v5 mới: offset từ last_pos → model học absolute shape
+        """
+        traj_norm = traj_gt - last_pos.unsqueeze(0)   # [T, B, 2]
+        me_norm   = Me_gt   - last_Me.unsqueeze(0)    # [T, B, 2]
+        return torch.cat([traj_norm, me_norm], dim=-1).permute(1, 0, 2)  # [B, T, 4]
 
     @staticmethod
     def rel_to_abs(rel, last_pos, last_Me):
-        d    = rel.permute(1, 0, 2)
-        traj = last_pos.unsqueeze(0) + torch.cumsum(d[:, :, :2], dim=0)
-        me   = last_Me.unsqueeze(0)  + torch.cumsum(d[:, :, 2:], dim=0)
+        """Inverse of traj_to_rel: offset + last_pos → absolute position."""
+        d    = rel.permute(1, 0, 2)            # [T, B, 4]
+        traj = last_pos.unsqueeze(0) + d[:, :, :2]   # không cumsum
+        me   = last_Me.unsqueeze(0)  + d[:, :, 2:]
         return traj, me
 
-    def _dir_loss(self, pred, gt, last_pos):
+    # ── FIX 2: Step-wise direction loss ───────────────────────────────────────
+    def _dir_loss(self, pred_abs, gt_abs, last_pos):
+        """
+        v5: kết hợp overall direction loss + step-wise direction loss.
+
+        Overall: so hướng tổng thể pred vs gt từ last_pos
+        Step-wise: so hướng velocity từng bước → phạt nặng khi sai hướng di chuyển
+        """
+        # Overall direction (giữ từ v4)
         ref = last_pos.unsqueeze(0)
-        return torch.clamp(
-            0.7 - (F.normalize(gt - ref, p=2, dim=-1) *
-                   F.normalize(pred - ref, p=2, dim=-1)).sum(-1),
+        overall = torch.clamp(
+            0.7 - (F.normalize(gt_abs - ref, p=2, dim=-1) *
+                   F.normalize(pred_abs - ref, p=2, dim=-1)).sum(-1),
             min=0
         ).mean()
 
-    def _smooth_loss(self, rel):
-        if rel.shape[1] < 2:
-            return rel.new_zeros(1).squeeze()
-        return ((rel[:, 1:, :2] - rel[:, :-1, :2]) ** 2).mean()
+        # Step-wise direction: so velocity từng bước
+        if pred_abs.shape[0] >= 2:
+            pred_v = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
+            gt_v   = gt_abs[1:]   - gt_abs[:-1]     # [T-1, B, 2]
+            # Cosine similarity giữa pred velocity và gt velocity
+            cos_sim = (F.normalize(pred_v, dim=-1) *
+                       F.normalize(gt_v,   dim=-1)).sum(-1)  # [T-1, B]
+            # Phạt khi cos < 0.5 (sai hướng > 60°)
+            step_dir = F.relu(0.5 - cos_sim).mean()
+        else:
+            step_dir = pred_abs.new_zeros(1).squeeze()
+
+        return overall + 2.0 * step_dir   # step_dir weight cao hơn
+
+    def _smooth_loss(self, traj_abs):
+        """
+        v5: smooth loss trên abs trajectory [T, B, 2].
+        Phạt acceleration lớn (noise/jitter), KHÔNG phạt recurvature dần dần.
+        traj_abs: [T, B, 2]
+        """
+        T = traj_abs.shape[0]
+        if T < 3:
+            return traj_abs.new_zeros(1).squeeze()
+        v   = traj_abs[1:] - traj_abs[:-1]   # velocity  [T-1, B, 2]
+        acc = v[1:] - v[:-1]                  # accel     [T-2, B, 2]
+        return (acc ** 2).mean()
 
     def _curvature_loss(self, pred_abs, gt_abs):
         if pred_abs.shape[0] < 3:
@@ -176,56 +208,20 @@ class TCFlowMatching(nn.Module):
         return (w * (pred_abs - gt_abs).abs()).mean()
 
     def _ns_pinn_loss(self, pred_abs):
-        """
-        PINN Vorticity Equation Residual — làm việc trong normalized units.
-
-        Phương trình: ∂ζ/∂t + β·v_y = 0
-
-        Tất cả trong normalized units (không convert sang m/s):
-          v_norm    : displacement/step  (~0.05-0.3)
-          ζ_norm    : cross(v[t+1], v[t])  (~0.001-0.05)
-          ∂ζ/∂t     : (ζ[t+1]-ζ[t]) / 1step  (normalized, no DT division)
-          β_norm    : 2Ω cos(φ) * DT_6H  (per step, dimensionless ~1-3)
-          v_y_norm  : meridional velocity (normalized)
-
-        Residual² ~ 0.01-0.1 → cùng magnitude với fm_loss ✅
-        """
         T = pred_abs.shape[0]
         if T < 4:
             return pred_abs.new_zeros(1).squeeze()
 
-        # Velocities [T-1, B, 2] — normalized units/step
-        v = pred_abs[1:] - pred_abs[:-1]
-
-        # Vorticity [T-2, B] — normalized units²/step²
-        zeta = (v[1:, :, 0] * v[:-1, :, 1]
-              - v[1:, :, 1] * v[:-1, :, 0])
-
-        # ∂ζ/∂t [T-3, B] — per step (không chia DT để giữ scale)
+        v        = pred_abs[1:] - pred_abs[:-1]
+        zeta     = (v[1:,:,0]*v[:-1,:,1] - v[1:,:,1]*v[:-1,:,0])
         dzeta_dt = zeta[1:] - zeta[:-1]
-
-        # β_norm = 2Ω cos(φ) * DT_6H  [T-3, B] — dimensionless per step
-        lat_rad  = torch.deg2rad(pred_abs[2:-1, :, 1] * 50.0)
-        beta_n   = 2 * OMEGA * lat_rad.cos() * DT_6H   # ~1-3, dimensionless
-
-        # v_y_norm [T-3, B]
-        v_y_n = v[1:-1, :, 1]
-
-        # Residual = ∂ζ/∂t + β_norm·v_y_norm  →  0 nếu thỏa mãn NS
+        lat_rad  = torch.deg2rad(pred_abs[2:-1,:,1] * 50.0)
+        beta_n   = 2 * OMEGA * lat_rad.cos() * DT_6H
+        v_y_n    = v[1:-1,:,1]
         residual = dzeta_dt + beta_n * v_y_n
-
         return (residual ** 2).mean()
 
     def get_loss(self, batch_list):
-        """
-        OT-CFM + Geometry losses + PINN Vorticity (NS thật).
-
-        Loss = L_CFM + L_geometry + λ_pinn * L_PINN
-
-        L_PINN = vorticity equation residual
-               = (∂ζ/∂t + β*v_y)²
-               → 0 khi track thỏa mãn NS vorticity equation
-        """
         traj_gt = batch_list[1]
         Me_gt   = batch_list[8]
         obs     = batch_list[0]
@@ -242,42 +238,32 @@ class TCFlowMatching(nn.Module):
         t     = torch.rand(B, device=device)
         t_exp = t.view(B, 1, 1)
 
-        # OT-CFM interpolation
-        x_t   = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
-        denom = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
+        x_t        = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
+        denom      = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
         target_vel = (x1 - (1 - sm) * x_t) / denom
 
-        # Forward — chỉ 1 forward pass
         pred_vel = self.net(x_t, t, batch_list)
         fm_loss  = F.mse_loss(pred_vel, target_vel)
 
-        # Reconstruct x1 → absolute trajectory
         pred_x1     = x_t + denom * pred_vel
         pred_abs, _ = self.rel_to_abs(pred_x1, lp, lm)
 
-        # Geometry losses (giữ nguyên từ diffusion)
+        # v5: dir_loss bao gồm cả step-wise direction
         dir_l  = self._dir_loss(pred_abs, traj_gt, lp)
-        smt_l  = self._smooth_loss(pred_x1)
+        smt_l  = self._smooth_loss(pred_abs)        # smooth trên abs trajectory
         disp_l = self._weighted_disp_loss(pred_abs, traj_gt)
         curv_l = self._curvature_loss(pred_abs, traj_gt)
-
-        # PINN: vorticity residual của predicted track phải → 0
-        # Residual = (∂ζ/∂t + β*v_y)²  — thỏa mãn NS vorticity eq
         pinn_l = self._ns_pinn_loss(pred_abs)
 
         return (fm_loss
-                + 2.0*dir_l
-                + 0.5*smt_l
-                + 1.0*disp_l
-                + 1.5*curv_l
-                + 0.5*pinn_l)   # λ_pinn = 0.5
+                + 2.0 * dir_l     # dir_l đã bao gồm step_dir × 2.0
+                + 0.3 * smt_l
+                + 1.0 * disp_l
+                + 1.5 * curv_l
+                + 0.5 * pinn_l)
 
     @torch.no_grad()
     def sample(self, batch_list, num_ensemble=5, ddim_steps=10):
-        """
-        OT-CFM Euler ODE: 10 steps (thay vì 20 của vanilla CFM).
-        Path thẳng hơn → ít steps hơn, nhanh hơn ~2x.
-        """
         obs_t, obs_m = batch_list[0], batch_list[7]
         lp, lm       = obs_t[-1], obs_m[-1]
         device       = lp.device
