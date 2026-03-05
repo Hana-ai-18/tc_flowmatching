@@ -447,6 +447,10 @@ import numpy as np
 import torch
 import matplotlib
 
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, project_root)
+
 from TCNM.flow_matching_model import TCFlowMatching
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
