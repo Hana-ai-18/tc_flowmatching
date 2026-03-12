@@ -75,7 +75,7 @@
 #         if 'pos_enc' in k and v.dim() == 3:
 #             return v.shape[1]
 
-#     print("⚠️  Không tìm thấy pos_enc key, dùng pred_len=12")
+#     print("  Không tìm thấy pos_enc key, dùng pred_len=12")
 #     return 12
 
 
@@ -138,7 +138,7 @@
 #                 print(f"🛰️  Nearest: {path}")
 #                 return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-#     print("⚠️  Himawari image not found – black background")
+#     print("  Himawari image not found – black background")
 #     return np.zeros((1000, 1000, 3), dtype=np.uint8)
 
 
@@ -155,7 +155,7 @@
 #     # ── Auto-detect pred_len ──────────────────────────────────────────────
 #     detected = detect_pred_len(args.model_path)
 #     if args.pred_len != detected:
-#         print(f"⚠️  pred_len: {args.pred_len} → {detected} (from checkpoint)")
+#         print(f"  pred_len: {args.pred_len} → {detected} (from checkpoint)")
 #         args.pred_len = detected
 
 #     # ── Load model ────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@
 #     sd    = ck.get('model_state_dict', ck.get('model_state', ck))
 #     model.load_state_dict(sd)
 #     model.eval()
-#     print("✅ Model loaded\n")
+#     print(" Model loaded\n")
 
 #     # ── Load dataset ──────────────────────────────────────────────────────
 #     dset, _ = data_loader(
@@ -173,7 +173,7 @@
 #         test=True,
 #         test_year=args.test_year,
 #     )
-#     print(f"✅ Dataset: {len(dset)} samples\n")
+#     print(f" Dataset: {len(dset)} samples\n")
 
 #     # ── Find typhoon sequence ─────────────────────────────────────────────
 #     t_name  = args.tc_name.strip().upper()
@@ -186,11 +186,11 @@
 #         if (t_name in str(info['old'][1]).strip().upper()
 #                 and t_date == str(info['tydate'][args.obs_len]).strip()):
 #             target = item
-#             print(f"✅ Found: {info['old'][1]}  @  {info['tydate'][args.obs_len]}\n")
+#             print(f" Found: {info['old'][1]}  @  {info['tydate'][args.obs_len]}\n")
 #             break
 
 #     if target is None:
-#         print(f"❌ '{t_name} @ {t_date}' not found. Check --tc_name and --tc_date.")
+#         print(f" '{t_name} @ {t_date}' not found. Check --tc_name and --tc_date.")
 #         # Gợi ý các sample có sẵn
 #         print("Available samples (first 10):")
 #         for i in range(min(10, len(dset))):
@@ -202,9 +202,9 @@
 #     batch = move_batch(seq_collate([target]), device)
 
 #     # ── Inference: proper DDPM sampling ──────────────────────────────────
-#     print("🔄 Running DDPM reverse diffusion sampling...")
+#     print(" Running DDPM reverse diffusion sampling...")
 #     pred_traj_t, pred_Me_t = model.sample(batch)  # [T_pred, B, 2]
-#     print("✅ Sampling done\n")
+#     print(" Sampling done\n")
 
 #     # ── Extract arrays ────────────────────────────────────────────────────
 #     obs_n  = batch[0][:, 0, :].cpu().numpy()    # [T_obs,  2] normalized
@@ -224,7 +224,7 @@
 #     # Error tính theo 0.1° units, 1 unit ≈ 11.1 km
 #     errors_km = np.linalg.norm(gt_r - pred_r, axis=1) * 11.1
 
-#     print("📊 Track errors:")
+#     print(" Track errors:")
 #     for i, e in enumerate(errors_km):
 #         mark = "  ◀" if (i + 1) in [4, 8, 12] else ""
 #         print(f"   +{(i+1)*6:3d}h : {e:6.1f} km{mark}")
@@ -239,7 +239,7 @@
 #     ref_r   = obs_r[-1]                        # last observed (0.1° units)
 #     ref_deg = real_to_deg(ref_r)               # degrees
 
-#     print(f"📍 Current position: LONG={ref_deg[0]:.2f}°E, LAT={ref_deg[1]:.2f}°N")
+#     print(f"  Current position: LONG={ref_deg[0]:.2f}°E, LAT={ref_deg[1]:.2f}°N")
 #     print(f"   GT 72h: LONG={gt_deg[-1,0]:.2f}°E, LAT={gt_deg[-1,1]:.2f}°N")
 #     print(f"   PD 72h: LONG={pred_deg[-1,0]:.2f}°E, LAT={pred_deg[-1,1]:.2f}°N\n")
 
@@ -398,7 +398,7 @@
 #     out = f"forecast_{fh}h_{t_name}_{t_date}.png"
 #     plt.savefig(out, dpi=200, bbox_inches='tight', facecolor='black')
 #     plt.close()
-#     print(f"✅ Saved → {out}\n")
+#     print(f" Saved → {out}\n")
 
 
 # # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -508,7 +508,7 @@ def detect_pred_len(ckpt_path):
         if 'pos_enc' in k and v.dim() == 3:
             return v.shape[1]
 
-    print("⚠️  Không tìm thấy pos_enc key, dùng pred_len=12")
+    print("  Không tìm thấy pos_enc key, dùng pred_len=12")
     return 12
 
 
@@ -571,7 +571,7 @@ def load_himawari(him_path, year, name, timestamp):
                 print(f"🛰️  Nearest: {path}")
                 return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    print("⚠️  Himawari image not found – black background")
+    print("  Himawari image not found – black background")
     return np.zeros((1000, 1000, 3), dtype=np.uint8)
 
 
@@ -588,7 +588,7 @@ def visualize_forecast(args):
     # ── Auto-detect pred_len ──────────────────────────────────────────────
     detected = detect_pred_len(args.model_path)
     if args.pred_len != detected:
-        print(f"⚠️  pred_len: {args.pred_len} → {detected} (from checkpoint)")
+        print(f"  pred_len: {args.pred_len} → {detected} (from checkpoint)")
         args.pred_len = detected
 
     # ── Load model ────────────────────────────────────────────────────────
@@ -597,11 +597,11 @@ def visualize_forecast(args):
     sd      = ck.get('model_state_dict', ck.get('model_state', ck))
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
-        print(f"⚠️  Missing keys (new layers, random init): {len(missing)}")
+        print(f"  Missing keys (new layers, random init): {len(missing)}")
     if unexpected:
-        print(f"⚠️  Unexpected keys (old layers, ignored): {len(unexpected)}")
+        print(f"  Unexpected keys (old layers, ignored): {len(unexpected)}")
     model.eval()
-    print("✅ Model loaded\n")
+    print(" Model loaded\n")
 
     # ── Load dataset ──────────────────────────────────────────────────────
     dset, _ = data_loader(
@@ -610,7 +610,7 @@ def visualize_forecast(args):
         test=True,
         test_year=args.test_year,
     )
-    print(f"✅ Dataset: {len(dset)} samples\n")
+    print(f" Dataset: {len(dset)} samples\n")
 
     # ── Find typhoon sequence ─────────────────────────────────────────────
     t_name  = args.tc_name.strip().upper()
@@ -623,11 +623,11 @@ def visualize_forecast(args):
         if (t_name in str(info['old'][1]).strip().upper()
                 and t_date == str(info['tydate'][args.obs_len]).strip()):
             target = item
-            print(f"✅ Found: {info['old'][1]}  @  {info['tydate'][args.obs_len]}\n")
+            print(f" Found: {info['old'][1]}  @  {info['tydate'][args.obs_len]}\n")
             break
 
     if target is None:
-        print(f"❌ '{t_name} @ {t_date}' not found. Check --tc_name and --tc_date.")
+        print(f" '{t_name} @ {t_date}' not found. Check --tc_name and --tc_date.")
         # Gợi ý các sample có sẵn
         print("Available samples (first 10):")
         for i in range(min(10, len(dset))):
@@ -639,9 +639,9 @@ def visualize_forecast(args):
     batch = move_batch(seq_collate([target]), device)
 
     # ── Inference: proper DDPM sampling ──────────────────────────────────
-    print("🔄 Running DDPM reverse diffusion sampling...")
+    print(" Running DDPM reverse diffusion sampling...")
     pred_traj_t, pred_Me_t = model.sample(batch)  # [T_pred, B, 2]
-    print("✅ Sampling done\n")
+    print(" Sampling done\n")
 
     # ── Extract arrays ────────────────────────────────────────────────────
     obs_n  = batch[0][:, 0, :].cpu().numpy()    # [T_obs,  2] normalized
@@ -661,7 +661,7 @@ def visualize_forecast(args):
     # Error tính theo 0.1° units, 1 unit ≈ 11.1 km
     errors_km = np.linalg.norm(gt_r - pred_r, axis=1) * 11.1
 
-    print("📊 Track errors:")
+    print(" Track errors:")
     for i, e in enumerate(errors_km):
         mark = "  ◀" if (i + 1) in [4, 8, 12] else ""
         print(f"   +{(i+1)*6:3d}h : {e:6.1f} km{mark}")
@@ -676,7 +676,7 @@ def visualize_forecast(args):
     ref_r   = obs_r[-1]                        # last observed (0.1° units)
     ref_deg = real_to_deg(ref_r)               # degrees
 
-    print(f"📍 Current position: LONG={ref_deg[0]:.2f}°E, LAT={ref_deg[1]:.2f}°N")
+    print(f"  Current position: LONG={ref_deg[0]:.2f}°E, LAT={ref_deg[1]:.2f}°N")
     print(f"   GT 72h: LONG={gt_deg[-1,0]:.2f}°E, LAT={gt_deg[-1,1]:.2f}°N")
     print(f"   PD 72h: LONG={pred_deg[-1,0]:.2f}°E, LAT={pred_deg[-1,1]:.2f}°N\n")
 
@@ -785,8 +785,8 @@ def visualize_forecast(args):
     last_e = errors_km[-1]
 
     ax.set_title(
-        f"🌀  {t_name}  –  {fh}h TC-FlowMatching Forecast\n"
-        f"📅  {dt_str}    │    Mean: {mean_e:.0f} km    │    {fh}h: {last_e:.0f} km",
+        f"  {t_name}  –  {fh}h TC-FlowMatching Forecast\n"
+        f"  {dt_str}    │    Mean: {mean_e:.0f} km    │    {fh}h: {last_e:.0f} km",
         fontsize=17, fontweight='bold', color='white', pad=18,
         bbox=dict(boxstyle='round,pad=0.9', facecolor='#000000',
                   alpha=0.92, edgecolor='#00FFFF', linewidth=2.5),
@@ -835,7 +835,7 @@ def visualize_forecast(args):
     out = f"forecast_{fh}h_{t_name}_{t_date}.png"
     plt.savefig(out, dpi=200, bbox_inches='tight', facecolor='black')
     plt.close()
-    print(f"✅ Saved → {out}\n")
+    print(f" Saved → {out}\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
