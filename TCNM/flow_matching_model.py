@@ -635,716 +635,11 @@
 # #==========================================================================
 # #===================================================================
 
-# # TCDiffusion = TCFlowMatching
-
-# """
-# TCNM/flow_matching_model.py  ── v7
-# ====================================
-# OT-CFM flow matching + physics-informed losses for TC trajectory prediction.
-# Loss function follows Eq. (60) exactly as written in the report.
-
-# Loss components:
-#     L1  FM loss          weight 1.0   Eq. (61) — OT-CFM velocity matching
-#     L2  overall_dir      weight 2.0   Eq. (62) — cosine of net displacement
-#     L3  step_dir         weight 0.5   Eq. (63) — per-step direction cosine
-#     L4  displacement     weight 1.0   Eq. (64) — weighted position L1
-#     L5  heading_change   weight 2.0   Eq. (65-66) — signed curvature MSE
-#     L6  smoothness       weight 0.2   Eq. (67) — discrete acceleration L2
-#     L7  PINN (BVE)       weight 0.5   Eq. (43-45) — barotropic vorticity eq.
-
-# PINN implementation notes
-# ──────────────────────────
-# Full BVE per Eq. (44):  r_k = ∂ζ/∂t + u_k·∂ζ/∂x + v_k·∂ζ/∂y ≈ 0
-
-# ERA5 is available at the 8 *observed* steps only (batch_list[13]).
-# For the 12 *predicted* steps we use the last observed ERA5 patch as a
-# temporal approximation.  Steering flow changes ≈2–5 % per 6 h (synoptic
-# scale), which is acceptable for soft regularisation.
-
-# If ERA5 u/v at 850 hPa cannot be parsed from batch_list[13], the code
-# falls back to the simplified BVE (∂ζ/∂t ≈ 0) in normalised coordinates.
-
-# ERA5 dict format expected (batch_list[13]):
-#     key 'u850' → tensor [B, T_obs, H, W]   zonal wind (m s⁻¹)
-#     key 'v850' → tensor [B, T_obs, H, W]   meridional wind (m s⁻¹)
-#     Grid: 9°×9° centred on storm at each obs step, 0.25°/pixel.
-#     Accepted alternative: tensor [B, C, T_obs, H, W] with channel
-#     order [u200,u500,u850,v200,v500,v850,...] (u850=ch2, v850=ch5).
-# """
-
-# from __future__ import annotations
-# import math
-# from typing import List, Tuple, Optional
-
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
-# from TCNM.Unet3D_merge_tiny import Unet3D
-# from TCNM.env_net_transformer_gphsplit import Env_net
-
-# # ── Physical constants ─────────────────────────────────────────────────────────
-# OMEGA    = 7.2921e-5   # Earth rotation rate  (rad s⁻¹)
-# R_EARTH  = 6.371e6     # Earth radius         (m)
-# DT_6H    = 6 * 3600    # Timestep             (s)
-
-# # Normalisation: lon_norm*5+180 = lon_deg,  lat_norm*5 = lat_deg
-# NORM_TO_DEG = 5.0
-
-# # ERA5 grid geometry
-# ERA5_RES_DEG  = 0.25   # degrees per pixel
-# DELTA_DEG     = 0.10   # perturbation for finite-difference vorticity (≈11 km)
-
-# NORM_TO_M        = NORM_TO_DEG * 111000.0
-# BETA_NORM_FACTOR = 2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH   # ~0.276
-
-# # ── ERA5 helpers ───────────────────────────────────────────────────────────────
-
-# def _bilinear_interp(
-#     field:      torch.Tensor,   # [B, H, W]
-#     center_lon: torch.Tensor,   # [B]  grid-centre longitude (degrees)
-#     center_lat: torch.Tensor,   # [B]  grid-centre latitude  (degrees)
-#     query_lon:  torch.Tensor,   # [B, N]
-#     query_lat:  torch.Tensor,   # [B, N]
-# ) -> torch.Tensor:              # [B, N]
-#     """
-#     Differentiable bilinear interpolation of an ERA5 patch.
-
-#     Grid convention
-#     ───────────────
-#     Pixel (0,0) is top-left  → (lat+HALF, lon-HALF).
-#     Row index increases southward; column index increases eastward.
-#     grid_sample uses (x=col, y=row) normalised to [-1, 1].
-#     """
-#     H, W = field.shape[-2], field.shape[-1]
-#     half_lon = (W // 2) * ERA5_RES_DEG
-#     half_lat = (H // 2) * ERA5_RES_DEG
-
-#     dlon = query_lon - center_lon.unsqueeze(1)   # [B, N]
-#     dlat = query_lat - center_lat.unsqueeze(1)   # [B, N]
-
-#     gx = ( dlon / half_lon).clamp(-1.0, 1.0)    # east  → positive x
-#     gy = (-dlat / half_lat).clamp(-1.0, 1.0)    # north → negative y (row 0 = top)
-
-#     grid = torch.stack([gx, gy], dim=-1).unsqueeze(1)   # [B, 1, N, 2]
-#     out  = F.grid_sample(
-#         field.unsqueeze(1),                              # [B, 1, H, W]
-#         grid,
-#         mode='bilinear', padding_mode='border', align_corners=True,
-#     )
-#     return out.squeeze(1).squeeze(1)                     # [B, N]
-
-
-# def _vorticity_era5(
-#     u850: torch.Tensor,   # [B, H, W]
-#     v850: torch.Tensor,   # [B, H, W]
-#     clon: torch.Tensor,   # [B]
-#     clat: torch.Tensor,   # [B]
-#     lon:  torch.Tensor,   # [B, N]  query longitudes (degrees)
-#     lat:  torch.Tensor,   # [B, N]  query latitudes  (degrees)
-# ) -> torch.Tensor:        # [B, N]
-#     """
-#     Relative vorticity at query points via centred finite difference (Eq. 43):
-#         ζ = ∂v/∂x − ∂u/∂y
-#           ≈ [v(λ+δ)−v(λ−δ)] / (2 δx)  −  [u(ϕ+δ)−u(ϕ−δ)] / (2 δy)
-
-#     δx = R⊕ cos(ϕ) δ π/180,   δy = R⊕ δ π/180
-#     """
-#     delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH          # scalar (m)
-
-#     v_xp = _bilinear_interp(v850, clon, clat, lon + DELTA_DEG, lat)
-#     v_xm = _bilinear_interp(v850, clon, clat, lon - DELTA_DEG, lat)
-#     u_yp = _bilinear_interp(u850, clon, clat, lon, lat + DELTA_DEG)
-#     u_ym = _bilinear_interp(u850, clon, clat, lon, lat - DELTA_DEG)
-
-#     cos_lat = torch.cos(torch.deg2rad(lat))                   # [B, N]
-#     dx = (cos_lat * delta_m).clamp(min=1.0)                   # [B, N] (m)
-#     dy = delta_m                                               # scalar (m)
-
-#     return (v_xp - v_xm) / (2.0 * dx) - (u_yp - u_ym) / (2.0 * dy)
-
-
-# def _parse_era5_uv850(
-#     batch_list: List,
-# ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor],
-#            torch.Tensor, torch.Tensor, bool]:
-#     """
-#     Extract u850, v850 at the last observed timestep.
-
-#     Returns
-#     -------
-#     u850_last : [B, H, W] or None
-#     v850_last : [B, H, W] or None
-#     clon      : [B]  storm longitude at last obs (degrees)
-#     clat      : [B]  storm latitude  at last obs (degrees)
-#     ok        : bool  True if ERA5 was parsed successfully
-#     """
-#     obs_traj = batch_list[0]            # [T_obs, B, 2]  normalised
-#     last     = obs_traj[-1]             # [B, 2]
-#     clon     = last[:, 0] * NORM_TO_DEG + 180.0
-#     clat     = last[:, 1] * NORM_TO_DEG
-
-#     env = batch_list[13]
-
-#     # Format A: dict with variable keys
-#     if isinstance(env, dict):
-#         u_key = next((k for k in ('u850', 'U850', 'u_850') if k in env), None)
-#         v_key = next((k for k in ('v850', 'V850', 'v_850') if k in env), None)
-#         if u_key is None or v_key is None:
-#             return None, None, clon, clat, False
-#         u = env[u_key]
-#         v = env[v_key]
-#         # Shape [B, T_obs, H, W] or [B, H, W]
-#         u_last = u[:, -1] if u.dim() == 4 else u
-#         v_last = v[:, -1] if v.dim() == 4 else v
-#         return u_last, v_last, clon, clat, True
-
-#     # Format B: tensor [B, C, T_obs, H, W]  (ch2=u850, ch5=v850)
-#     if isinstance(env, torch.Tensor) and env.dim() == 5:
-#         return env[:, 2, -1], env[:, 5, -1], clon, clat, True
-
-#     # Format C: tensor [B, C, H, W]
-#     if isinstance(env, torch.Tensor) and env.dim() == 4:
-#         return env[:, 2], env[:, 5], clon, clat, True
-
-#     return None, None, clon, clat, False
-
-
-# # ── Velocity Field ─────────────────────────────────────────────────────────────
-
-# class VelocityField(nn.Module):
-#     """
-#     Learned OT-CFM velocity field conditioned on observed track + ERA5 context.
-
-#     Architecture
-#     ────────────
-#     • UNet3D      – spatial encoder for ERA5 image patches
-#     • Env_net     – multi-level environmental context encoder
-#     • LSTM        – observed track encoder
-#     • TransformerDecoder – generates per-step velocity for pred_len steps
-#     """
-
-#     def __init__(
-#         self,
-#         pred_len:  int   = 12,
-#         obs_len:   int   = 8,
-#         ctx_dim:   int   = 128,
-#         sigma_min: float = 0.02,
-#     ):
-#         super().__init__()
-#         self.pred_len  = pred_len
-#         self.obs_len   = obs_len
-#         self.sigma_min = sigma_min
-
-#         # Encoders
-#         self.spatial_enc  = Unet3D(in_channel=1, out_channel=1)
-#         self.env_enc      = Env_net(obs_len=obs_len, d_model=64)
-#         self.obs_lstm     = nn.LSTM(
-#             input_size=4, hidden_size=128, num_layers=3,
-#             batch_first=True, dropout=0.2,
-#         )
-#         self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
-
-#         # Context projection
-#         self.ctx_fc1  = nn.Linear(16 + 64 + 128, 512)
-#         self.ctx_ln   = nn.LayerNorm(512)
-#         self.ctx_drop = nn.Dropout(0.15)
-#         self.ctx_fc2  = nn.Linear(512, ctx_dim)
-
-#         # Time embedding projection
-#         self.time_fc1 = nn.Linear(128, 256)
-#         self.time_fc2 = nn.Linear(256, 128)
-
-#         # Trajectory token embedding + learnable positional encoding
-#         self.traj_embed = nn.Linear(4, 128)
-#         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 128) * 0.02)
-
-#         # Decoder
-#         self.transformer = nn.TransformerDecoder(
-#             nn.TransformerDecoderLayer(
-#                 d_model=128, nhead=8, dim_feedforward=512,
-#                 dropout=0.15, activation='gelu', batch_first=True,
-#             ),
-#             num_layers=4,
-#         )
-#         self.out_fc1 = nn.Linear(128, 256)
-#         self.out_fc2 = nn.Linear(256, 4)
-
-#     # ------------------------------------------------------------------
-#     def _time_emb(self, t: torch.Tensor, dim: int = 128) -> torch.Tensor:
-#         half = dim // 2
-#         freq = torch.exp(
-#             torch.arange(half, dtype=torch.float32, device=t.device)
-#             * (-math.log(10000.0) / (half - 1))
-#         )
-#         emb = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
-#         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-#         return F.pad(emb, (0, 1)) if dim % 2 else emb
-
-#     def _context(self, batch_list: List) -> torch.Tensor:
-#         obs_traj  = batch_list[0]     # [T_obs, B, 2]
-#         obs_Me    = batch_list[7]     # [T_obs, B, 2]
-#         image_obs = batch_list[11]    # [B, 1, T_obs, H, W]
-#         env_data  = batch_list[13]
-
-#         f_s = self.spatial_enc(image_obs).mean(dim=2)   # [B, C, H, W]
-#         f_s = self.spatial_pool(f_s).flatten(1)         # [B, 16]
-
-#         f_e, _, _ = self.env_enc(env_data, image_obs)   # [B, 64]
-
-#         obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)  # [B, T_obs, 4]
-#         _, (h_n, _) = self.obs_lstm(obs_in)
-#         f_h = h_n[-1]                                   # [B, 128]
-
-#         ctx = torch.cat([f_s, f_e, f_h], dim=-1)        # [B, 208]
-#         ctx = F.gelu(self.ctx_ln(self.ctx_fc1(ctx)))
-#         ctx = self.ctx_drop(ctx)
-#         return self.ctx_fc2(ctx)                         # [B, ctx_dim]
-
-#     def forward(
-#         self,
-#         x_t:       torch.Tensor,   # [B, T_pred, 4]
-#         t:         torch.Tensor,   # [B]
-#         batch_list: List,
-#     ) -> torch.Tensor:             # [B, T_pred, 4]
-#         ctx   = self._context(batch_list)                # [B, 128]
-#         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
-#         t_emb = self.time_fc2(t_emb)                     # [B, 128]
-
-#         x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)  # [B, T, 128]
-#         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)   # [B, 2, 128]
-
-#         out = self.transformer(x_emb, memory)
-#         return self.out_fc2(F.gelu(self.out_fc1(out)))   # [B, T, 4]
-
-
-# # ── TCFlowMatching ─────────────────────────────────────────────────────────────
-
-# class TCFlowMatching(nn.Module):
-#     """
-#     Tropical cyclone trajectory prediction via Optimal-Transport CFM
-#     with physics-informed auxiliary losses.
-
-#     Loss weights follow Eq. (60) exactly.
-#     """
-
-#     def __init__(
-#         self,
-#         pred_len:  int   = 12,
-#         obs_len:   int   = 8,
-#         sigma_min: float = 0.02,
-#         **kwargs,
-#     ):
-#         super().__init__()
-#         self.pred_len  = pred_len
-#         self.obs_len   = obs_len
-#         self.sigma_min = sigma_min
-#         self.net       = VelocityField(pred_len, obs_len, sigma_min=sigma_min)
-
-#     # ── Coordinate encoding ────────────────────────────────────────────────────
-
-#     @staticmethod
-#     def traj_to_rel(
-#         traj_gt:  torch.Tensor,   # [T, B, 2]
-#         Me_gt:    torch.Tensor,   # [T, B, 2]
-#         last_pos: torch.Tensor,   # [B, 2]
-#         last_Me:  torch.Tensor,   # [B, 2]
-#     ) -> torch.Tensor:            # [B, T, 4]
-#         """Encode as absolute offset from last observed position."""
-#         traj_enc = traj_gt - last_pos.unsqueeze(0)
-#         me_enc   = Me_gt   - last_Me.unsqueeze(0)
-#         return torch.cat([traj_enc, me_enc], dim=-1).permute(1, 0, 2)
-
-#     @staticmethod
-#     def rel_to_abs(
-#         rel:      torch.Tensor,   # [B, T, 4]
-#         last_pos: torch.Tensor,   # [B, 2]
-#         last_Me:  torch.Tensor,   # [B, 2]
-#     ) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """Decode offset encoding → absolute normalised coordinates."""
-#         d    = rel.permute(1, 0, 2)                  # [T, B, 4]
-#         traj = last_pos.unsqueeze(0) + d[:, :, :2]   # [T, B, 2]
-#         me   = last_Me.unsqueeze(0)  + d[:, :, 2:]   # [T, B, 2]
-#         return traj, me
-
-#     # ── L2: Overall direction loss — Eq. (62) ─────────────────────────────────
-
-#     def _overall_dir_loss(
-#         self,
-#         pred_abs: torch.Tensor,   # [T, B, 2]
-#         gt_abs:   torch.Tensor,   # [T, B, 2]
-#         last_pos: torch.Tensor,   # [B, 2]
-#     ) -> torch.Tensor:
-#         """
-#         L = 1 − cos( x̂_k − x₀,  x_k − x₀ )   averaged over k=1..T
-#         """
-#         ref  = last_pos.unsqueeze(0)
-
-#         p = pred_abs - ref
-#         g = gt_abs   - ref
-
-#         pn = p.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-#         gn = g.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-
-#         return (1.0 - ((p / pn) * (g / gn)).sum(-1)).mean()
-
-#     # ── L3: Step-wise direction loss — Eq. (63) ───────────────────────────────
-
-#     def _step_dir_loss(
-#         self,
-#         pred_abs: torch.Tensor,
-#         gt_abs:   torch.Tensor,
-#     ) -> torch.Tensor:
-#         """
-#         L = mean_k( 1 − cos( v̂_k, v_k ) )   where v_k = x_{k+1} − x_k
-#         """
-#         if pred_abs.shape[0] < 2:
-#             return pred_abs.new_zeros(())
-
-#         pv = pred_abs[1:] - pred_abs[:-1]
-#         gv = gt_abs[1:]   - gt_abs[:-1]
-
-#         pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-#         gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-
-#         return (1.0 - ((pv / pn) * (gv / gn)).sum(-1)).mean()
-
-#     # ── L4: Displacement loss — Eq. (64) ──────────────────────────────────────
-
-#     def _disp_loss(
-#         self,
-#         pred_abs: torch.Tensor,
-#         gt_abs:   torch.Tensor,
-#     ) -> torch.Tensor:
-#         """Weighted L1 displacement; weight increases toward later steps."""
-#         T = pred_abs.shape[0]
-#         w = torch.linspace(1.0, 2.5, T, device=pred_abs.device).view(T, 1, 1)
-#         return (w * (pred_abs - gt_abs).abs()).mean()
-
-#     # ── L5: Heading change loss — Eq. (65–66) ─────────────────────────────────
-
-#     def _heading_loss(
-#         self,
-#         pred_abs: torch.Tensor,
-#         gt_abs:   torch.Tensor,
-#     ) -> torch.Tensor:
-#         """
-#         Signed curvature:  κ_k = cross(v_{k+1}, v_k) / (|v_{k+1}| |v_k|)
-
-#         L = mean_k[ (κ̂_k − κ_k)²  +  ReLU(−κ̂_k · κ_k) ]
-
-#         The ReLU term penalises wrong-direction turns.
-#         """
-#         if pred_abs.shape[0] < 3:
-#             return pred_abs.new_zeros(())
-
-#         pv = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
-#         gv = gt_abs[1:]   - gt_abs[:-1]
-
-#         def curvature(v: torch.Tensor) -> torch.Tensor:
-#             # cross(v[t+1], v[t]) = vx[t+1]*vy[t] − vy[t+1]*vx[t]
-#             cross = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
-#             n1    = v[1:].norm(dim=-1).clamp(min=1e-6)
-#             n2    = v[:-1].norm(dim=-1).clamp(min=1e-6)
-#             return cross / (n1 * n2)                         # [T-2, B]
-
-#         pc = curvature(pv)
-#         gc = curvature(gv)
-
-#         return F.mse_loss(pc, gc) + F.relu(-(pc * gc)).mean()
-
-#     # ── L6: Smoothness loss — Eq. (67) ────────────────────────────────────────
-
-#     def _smooth_loss(self, traj_abs: torch.Tensor) -> torch.Tensor:
-#         """
-#         L = mean_k ‖x_{k+1} − 2x_k + x_{k−1}‖²
-#         Discrete second derivative (acceleration) — zero for straight lines.
-#         """
-#         if traj_abs.shape[0] < 3:
-#             return traj_abs.new_zeros(())
-#         acc = traj_abs[2:] - 2.0 * traj_abs[1:-1] + traj_abs[:-2]
-#         return (acc ** 2).mean()
-
-#     # ── L7: PINN (BVE) loss — Eq. (43–45) ─────────────────────────────────────
-
-#     def _pinn_loss(
-#         self,
-#         pred_abs:  torch.Tensor,   # [T, B, 2]  normalised
-#         batch_list: List,
-#     ) -> torch.Tensor:
-#         """
-#         Barotropic Vorticity Equation residual:
-#             r_k = ∂ζ/∂t  +  u_k · ∂ζ/∂x  +  v_k · ∂ζ/∂y  ≈ 0
-
-#         u_k, v_k — storm velocity from track  (centered diff, Eq. 40–41)
-#         ζ        — ERA5 relative vorticity at storm position  (Eq. 43)
-#         ∂ζ/∂t    — centred time difference of ζ  (Eq. 44a)
-#         ∂ζ/∂x/y  — centred spatial difference of ζ  (Eq. 44b–c)
-#         """
-#         T = pred_abs.shape[0]
-#         if T < 4:
-#             return pred_abs.new_zeros(())
-
-#         # Degrees
-#         lon = pred_abs[..., 0] * NORM_TO_DEG + 180.0   # [T, B]
-#         lat = pred_abs[..., 1] * NORM_TO_DEG            # [T, B]
-
-#         # ── Storm velocity u_k, v_k (m s⁻¹) — interior k=1..T-2 ──────────────
-#         dlon_rad = (lon[2:] - lon[:-2]) * (math.pi / 180.0)   # [T-2, B]
-#         dlat_rad = (lat[2:] - lat[:-2]) * (math.pi / 180.0)   # [T-2, B]
-#         cos_lat  = torch.cos(torch.deg2rad(lat[1:-1]))         # [T-2, B]
-
-#         u_k = R_EARTH * cos_lat * dlon_rad / (2.0 * DT_6H)    # [T-2, B]
-#         v_k = R_EARTH           * dlat_rad / (2.0 * DT_6H)    # [T-2, B]
-
-#         # ── Try ERA5 ──────────────────────────────────────────────────────────
-#         u850, v850, clon, clat, era5_ok = _parse_era5_uv850(batch_list)
-
-#         if not era5_ok:
-#             return self._pinn_loss_simplified(pred_abs)
-
-#         device = pred_abs.device
-#         u850 = u850.to(device)
-#         v850 = v850.to(device)
-#         clon = clon.to(device)
-#         clat = clat.to(device)
-
-#         # ── ζ at every predicted step — [B, T] then → [T, B] ─────────────────
-#         lon_BT = lon.permute(1, 0)   # [B, T]
-#         lat_BT = lat.permute(1, 0)   # [B, T]
-
-#         zeta_BT = _vorticity_era5(u850, v850, clon, clat, lon_BT, lat_BT)
-#         zeta    = zeta_BT.permute(1, 0)   # [T, B]
-
-#         # ── ∂ζ/∂t  (centred, s⁻²) ─────────────────────────────────────────────
-#         # Interior k=1..T-2
-#         dzeta_dt = (zeta[2:] - zeta[:-2]) / (2.0 * DT_6H)    # [T-2, B]
-
-#         # ── ∂ζ/∂x, ∂ζ/∂y  (centred spatial diff, m⁻¹ s⁻¹) ──────────────────
-#         lon_int = lon_BT[:, 1:-1]   # [B, T-2]
-#         lat_int = lat_BT[:, 1:-1]   # [B, T-2]
-#         delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH        # (m)
-
-#         zeta_xp = _vorticity_era5(u850, v850, clon, clat,
-#                                    lon_int + DELTA_DEG, lat_int).permute(1, 0)  # [T-2, B]
-#         zeta_xm = _vorticity_era5(u850, v850, clon, clat,
-#                                    lon_int - DELTA_DEG, lat_int).permute(1, 0)
-#         zeta_yp = _vorticity_era5(u850, v850, clon, clat,
-#                                    lon_int, lat_int + DELTA_DEG).permute(1, 0)
-#         zeta_ym = _vorticity_era5(u850, v850, clon, clat,
-#                                    lon_int, lat_int - DELTA_DEG).permute(1, 0)
-
-#         cos_int = torch.cos(torch.deg2rad(lat[1:-1]))           # [T-2, B]
-#         dx = (cos_int * delta_m).clamp(min=1.0)                 # [T-2, B]
-#         dy = delta_m
-
-#         dzeta_dx = (zeta_xp - zeta_xm) / (2.0 * dx)            # [T-2, B]
-#         dzeta_dy = (zeta_yp - zeta_ym) / (2.0 * dy)            # [T-2, B]
-
-#         # ── BVE residual  r_k = ∂ζ/∂t + u·∂ζ/∂x + v·∂ζ/∂y — Eq. (44) ───────
-#         residual = dzeta_dt + u_k * dzeta_dx + v_k * dzeta_dy   # [T-2, B]
-
-#         # ── L_PINN = (1/N) Σ r_k²  — Eq. (45) ───────────────────────────────
-#         return (residual ** 2).mean()
-
-#     def _pinn_loss_simplified(self, pred_abs: torch.Tensor) -> torch.Tensor:
-#         """
-#         Fallback when ERA5 u/v850 is unavailable.
-#         Simplified BVE  ∂ζ/∂t + β v ≈ 0  in normalised coordinates.
-#         Provides non-zero, well-scaled gradient without ERA5 data.
-#         """
-
-#         T = pred_abs.shape[0]
-#         if T < 4:
-#             return pred_abs.new_zeros(1).squeeze()
-
-#         v  = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
-#         vx = v[..., 0]                       # [T-1, B]
-#         vy = v[..., 1]                       # [T-1, B]
-
-#         # ζ[t] = vx[t+1]*vy[t] - vy[t+1]*vx[t]  →  [T-2, B]
-#         zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
-
-#         if zeta.shape[0] < 2:
-#             return pred_abs.new_zeros(1).squeeze()
-
-#         # Δζ[t] = ζ[t+1] - ζ[t]  →  [T-3, B]
-#         dzeta = zeta[1:] - zeta[:-1]
-
-#         # β at positions 2..T-2  →  [T-3, B]
-#         # pred_abs[2 : T-1] has shape [T-3, B, 2]
-#         lat_norm = pred_abs[2:T-1, :, 1]                          # [T-3, B]
-#         lat_rad  = lat_norm * NORM_TO_DEG * (math.pi / 180.0)
-#         beta_n   = BETA_NORM_FACTOR * torch.cos(lat_rad)          # [T-3, B]
-
-#         # v_y at same positions  →  [T-3, B]
-#         # v[t] = pred_abs[t+1] - pred_abs[t], so v[1:T-2] aligns with steps 2..T-2
-#         v_y = vy[1:T-2]                                           # [T-3, B]
-
-#         residual = dzeta + beta_n * v_y                           # [T-3, B]
-#         return (residual ** 2).mean()
-
-#     # ── Training loss — Eq. (60) ───────────────────────────────────────────────
-
-#     def get_loss(self, batch_list: List) -> torch.Tensor:
-#         """
-#         L_total = 1.0·L_FM  +  2.0·L_dir  +  0.5·L_step
-#                 + 1.0·L_disp  +  2.0·L_heading  +  0.2·L_smooth
-#                 + 0.5·L_PINN
-#         """
-#         traj_gt = batch_list[1]    # [T_pred, B, 2]
-#         Me_gt   = batch_list[8]    # [T_pred, B, 2]
-#         obs_t   = batch_list[0]    # [T_obs, B, 2]
-#         obs_Me  = batch_list[7]    # [T_obs, B, 2]
-
-#         B      = traj_gt.shape[1]
-#         device = traj_gt.device
-#         lp     = obs_t[-1]         # [B, 2]  last observed position
-#         lm     = obs_Me[-1]        # [B, 2]
-#         sm     = self.sigma_min
-
-#         # ── OT-CFM interpolation ───────────────────────────────────────────────
-#         x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)  # [B, T, 4]
-#         x0    = torch.randn_like(x1) * sm
-#         t     = torch.rand(B, device=device)
-#         te    = t.view(B, 1, 1)
-
-#         x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
-#         denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
-#         target_vel = (x1 - (1.0 - sm) * x_t) / denom
-
-#         pred_vel = self.net(x_t, t, batch_list)
-#         fm_loss  = F.mse_loss(pred_vel, target_vel)
-
-#         # ── Recover predicted absolute trajectory ──────────────────────────────
-#         pred_x1      = x_t + denom * pred_vel
-#         pred_abs, _  = self.rel_to_abs(pred_x1, lp, lm)   # [T, B, 2]
-
-#         # ── Auxiliary losses ───────────────────────────────────────────────────
-#         l_dir     = self._overall_dir_loss(pred_abs, traj_gt, lp)
-#         l_step    = self._step_dir_loss(pred_abs, traj_gt)
-#         l_disp    = self._disp_loss(pred_abs, traj_gt)
-#         l_heading = self._heading_loss(pred_abs, traj_gt)
-#         l_smooth  = self._smooth_loss(pred_abs)
-#         l_pinn    = self._pinn_loss(pred_abs, batch_list)
-
-#         # ── Eq. (60) ───────────────────────────────────────────────────────────
-#         return (
-#             1.0 * fm_loss
-#           + 2.0 * l_dir
-#           + 0.5 * l_step
-#           + 1.0 * l_disp
-#           + 2.0 * l_heading
-#           + 0.2 * l_smooth
-#           + 0.5 * l_pinn
-#         )
-
-#     def get_loss_breakdown(self, batch_list: List) -> dict:
-#         """Same as get_loss() but also returns individual component values for logging."""
-#         traj_gt = batch_list[1]
-#         Me_gt   = batch_list[8]
-#         obs_t   = batch_list[0]
-#         obs_Me  = batch_list[7]
-
-#         B, device = traj_gt.shape[1], traj_gt.device
-#         lp, lm    = obs_t[-1], obs_Me[-1]
-#         sm        = self.sigma_min
-
-#         x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)
-#         x0    = torch.randn_like(x1) * sm
-#         t     = torch.rand(B, device=device)
-#         te    = t.view(B, 1, 1)
-
-#         # x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
-#         # denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
-#         # target_vel = (x1 - (1.0 - sm) * x_t) / denom
-
-#         # OT-CFM interpolation (Tong et al. 2024, Eq.51 báo cáo đã cập nhật)
-#         # x_t = t*x1 + (1 - t*(1-sigma_min))*x0
-#         # Khác với FM thuần (sigma_min=0): thêm sigma_min để source distribution
-#         # không collapse, giúp training ổn định với dataset nhỏ (N=2196).
-#         # sigma_min=0.02 (v7) thay vì 0.001 (v4) để tránh near-deterministic paths.
-#         x_t   = te * x1 + (1.0 - te * (1.0 - self.sigma_min)) * x0
-#         denom = (1.0 - (1.0 - self.sigma_min) * te).clamp(min=1e-5)
-#         # target velocity = (x1 - (1-sigma_min)*x0) / (1 - (1-sigma_min)*t)
-#         target_vel = (x1 - (1.0 - self.sigma_min) * x_t) / denom
-        
-#         pred_vel = self.net(x_t, t, batch_list)
-#         fm_loss  = F.mse_loss(pred_vel, target_vel)
-
-#         pred_x1     = x_t + denom * pred_vel
-#         pred_abs, _ = self.rel_to_abs(pred_x1, lp, lm)
-
-#         l_dir     = self._overall_dir_loss(pred_abs, traj_gt, lp)
-#         l_step    = self._step_dir_loss(pred_abs, traj_gt)
-#         l_disp    = self._disp_loss(pred_abs, traj_gt)
-#         l_heading = self._heading_loss(pred_abs, traj_gt)
-#         l_smooth  = self._smooth_loss(pred_abs)
-#         l_pinn    = self._pinn_loss(pred_abs, batch_list)
-
-#         total = (1.0*fm_loss + 2.0*l_dir + 0.5*l_step + 1.0*l_disp
-#                + 2.0*l_heading + 0.2*l_smooth + 0.5*l_pinn)
-
-#         return {
-#             'total':   total,
-#             'fm':      fm_loss.item(),
-#             'dir':     l_dir.item(),
-#             'step':    l_step.item(),
-#             'disp':    l_disp.item(),
-#             'heading': l_heading.item(),
-#             'smooth':  l_smooth.item(),
-#             'pinn':    l_pinn.item(),
-#         }
-
-#     # ── Inference ──────────────────────────────────────────────────────────────
-
-#     @torch.no_grad()
-#     def sample(
-#         self,
-#         batch_list:   List,
-#         num_ensemble: int = 5,
-#         ddim_steps:   int = 10,
-#     ) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         Euler integration of the learned velocity field.
-
-#         Returns predicted trajectory [T_pred, B, 2] and intensity [T_pred, B, 2].
-#         Clamp offset to ±5 normalised units (≈ 2750 km from last position).
-#         """
-#         lp     = batch_list[0][-1]    # [B, 2]
-#         lm     = batch_list[7][-1]    # [B, 2]
-#         B      = lp.shape[0]
-#         device = lp.device
-#         dt     = 1.0 / ddim_steps
-
-#         traj_samples = []
-#         me_samples   = []
-
-#         for _ in range(num_ensemble):
-#             x_t = torch.randn(B, self.pred_len, 4, device=device) * self.sigma_min
-#             for i in range(ddim_steps):
-#                 t_b = torch.full((B,), i * dt, device=device)
-#                 x_t = x_t + dt * self.net(x_t, t_b, batch_list)
-#                 x_t[:, :, :2].clamp_(-5.0, 5.0)
-#             traj, me = self.rel_to_abs(x_t, lp, lm)
-#             traj_samples.append(traj)
-#             me_samples.append(me)
-
-#         return (
-#             torch.stack(traj_samples).mean(0),
-#             torch.stack(me_samples).mean(0),
-#         )
-
-
-# # Backward-compatibility alias
 # TCDiffusion = TCFlowMatching
 
-#=====  ──────────────────────────────────────────────────────────────────────────────
-#==   End of TCFlowMatching implementation
-
 """
-TCNM/flow_matching_model.py  ── v7  [FIXED]
-============================================
+TCNM/flow_matching_model.py  ── v7
+====================================
 OT-CFM flow matching + physics-informed losses for TC trajectory prediction.
 Loss function follows Eq. (60) exactly as written in the report.
 
@@ -1357,31 +652,24 @@ Loss components:
     L6  smoothness       weight 0.2   Eq. (67) — discrete acceleration L2
     L7  PINN (BVE)       weight 0.5   Eq. (43-45) — barotropic vorticity eq.
 
-BUGS FIXED vs original v7
+PINN implementation notes
 ──────────────────────────
-BUG 1 │ _parse_era5_uv850: sai channel index cho ERA5 tensor
-       │ Paper TCND channels: [SST(0), GPH×4(1-4), U×4(5-8), V×4(9-12)]
-       │ U850 = ch7, V850 = ch11  (không phải ch2, ch5 như code cũ)
-       │ Hậu quả: ERA5 trả về sai field → vorticity sai → ok có thể False
-       │ hoặc ra residual sai scale → pinn ≈ 0.0005 thay vì 0.05+
+Full BVE per Eq. (44):  r_k = ∂ζ/∂t + u_k·∂ζ/∂x + v_k·∂ζ/∂y ≈ 0
 
-BUG 2 │ _pinn_loss_simplified: residual² quá nhỏ (~100× bé hơn target)
-       │ Trong normalized coords, velocity ~0.05 norm/step → zeta ~0.0025
-       │ → residual² ~1e-4, pinn~0.0005 (báo cáo cần ~0.05)
-       │ Fix: nhân scale factor PINN_SIMPLIFIED_SCALE = 100.0
-       │ → pinn_raw ~0.01–0.1, sau weight 0.5 → ~0.005–0.05 ✓
+ERA5 is available at the 8 *observed* steps only (batch_list[13]).
+For the 12 *predicted* steps we use the last observed ERA5 patch as a
+temporal approximation.  Steering flow changes ≈2–5 % per 6 h (synoptic
+scale), which is acceptable for soft regularisation.
 
-BUG 3 │ evaluate() trong train.py: num_ensemble=5 → 6452ms/batch
-       │ 5 ensemble × 10 ODE steps = 50 forward passes mỗi batch
-       │ Fix: dùng num_ensemble=1 trong training eval loop,
-       │      giữ num_ensemble=5 chỉ cho final test evaluation
+If ERA5 u/v at 850 hPa cannot be parsed from batch_list[13], the code
+falls back to the simplified BVE (∂ζ/∂t ≈ 0) in normalised coordinates.
 
 ERA5 dict format expected (batch_list[13]):
     key 'u850' → tensor [B, T_obs, H, W]   zonal wind (m s⁻¹)
     key 'v850' → tensor [B, T_obs, H, W]   meridional wind (m s⁻¹)
-    Grid: 9°×9° centred on storm, 0.25°/pixel.
+    Grid: 9°×9° centred on storm at each obs step, 0.25°/pixel.
     Accepted alternative: tensor [B, C, T_obs, H, W] with channel
-    order [SST,GPH×4,U×4,V×4] → U850=ch7, V850=ch11.
+    order [u200,u500,u850,v200,v500,v850,...] (u850=ch2, v850=ch5).
 """
 
 from __future__ import annotations
@@ -1408,50 +696,39 @@ ERA5_RES_DEG  = 0.25   # degrees per pixel
 DELTA_DEG     = 0.10   # perturbation for finite-difference vorticity (≈11 km)
 
 NORM_TO_M        = NORM_TO_DEG * 111000.0
-BETA_NORM_FACTOR = 2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH   # ~0.274
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG 2 FIX: Scale factor for simplified PINN fallback.
-# Velocity in normalised coords is ~50× smaller than needed to produce
-# residuals² of the same order as the target pinn ~0.05.
-# Multiplying by 100 brings the simplified loss into the correct range.
-# ─────────────────────────────────────────────────────────────────────────────
-PINN_SIMPLIFIED_SCALE = 100.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TCND Data3d channel order (from paper Table 1.1):
-#   0        SST
-#   1–4      GPH @ 200, 500, 850, 925 hPa
-#   5–8      U   @ 200, 500, 850, 925 hPa   ← U850 = ch 7
-#   9–12     V   @ 200, 500, 850, 925 hPa   ← V850 = ch 11
-# ─────────────────────────────────────────────────────────────────────────────
-ERA5_CH_U850 = 7   # BUG 1 FIX: was 2 (U500) in original code
-ERA5_CH_V850 = 11  # BUG 1 FIX: was 5 (V200) in original code
-
+BETA_NORM_FACTOR = 2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH   # ~0.276
 
 # ── ERA5 helpers ───────────────────────────────────────────────────────────────
 
 def _bilinear_interp(
     field:      torch.Tensor,   # [B, H, W]
-    center_lon: torch.Tensor,   # [B]
-    center_lat: torch.Tensor,   # [B]
+    center_lon: torch.Tensor,   # [B]  grid-centre longitude (degrees)
+    center_lat: torch.Tensor,   # [B]  grid-centre latitude  (degrees)
     query_lon:  torch.Tensor,   # [B, N]
     query_lat:  torch.Tensor,   # [B, N]
 ) -> torch.Tensor:              # [B, N]
-    """Differentiable bilinear interpolation of an ERA5 patch."""
+    """
+    Differentiable bilinear interpolation of an ERA5 patch.
+
+    Grid convention
+    ───────────────
+    Pixel (0,0) is top-left  → (lat+HALF, lon-HALF).
+    Row index increases southward; column index increases eastward.
+    grid_sample uses (x=col, y=row) normalised to [-1, 1].
+    """
     H, W = field.shape[-2], field.shape[-1]
     half_lon = (W // 2) * ERA5_RES_DEG
     half_lat = (H // 2) * ERA5_RES_DEG
 
-    dlon = query_lon - center_lon.unsqueeze(1)
-    dlat = query_lat - center_lat.unsqueeze(1)
+    dlon = query_lon - center_lon.unsqueeze(1)   # [B, N]
+    dlat = query_lat - center_lat.unsqueeze(1)   # [B, N]
 
-    gx = ( dlon / half_lon).clamp(-1.0, 1.0)
-    gy = (-dlat / half_lat).clamp(-1.0, 1.0)
+    gx = ( dlon / half_lon).clamp(-1.0, 1.0)    # east  → positive x
+    gy = (-dlat / half_lat).clamp(-1.0, 1.0)    # north → negative y (row 0 = top)
 
     grid = torch.stack([gx, gy], dim=-1).unsqueeze(1)   # [B, 1, N, 2]
     out  = F.grid_sample(
-        field.unsqueeze(1),
+        field.unsqueeze(1),                              # [B, 1, H, W]
         grid,
         mode='bilinear', padding_mode='border', align_corners=True,
     )
@@ -1463,20 +740,26 @@ def _vorticity_era5(
     v850: torch.Tensor,   # [B, H, W]
     clon: torch.Tensor,   # [B]
     clat: torch.Tensor,   # [B]
-    lon:  torch.Tensor,   # [B, N]
-    lat:  torch.Tensor,   # [B, N]
+    lon:  torch.Tensor,   # [B, N]  query longitudes (degrees)
+    lat:  torch.Tensor,   # [B, N]  query latitudes  (degrees)
 ) -> torch.Tensor:        # [B, N]
-    """Relative vorticity ζ = ∂v/∂x − ∂u/∂y via centred finite difference."""
-    delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH
+    """
+    Relative vorticity at query points via centred finite difference (Eq. 43):
+        ζ = ∂v/∂x − ∂u/∂y
+          ≈ [v(λ+δ)−v(λ−δ)] / (2 δx)  −  [u(ϕ+δ)−u(ϕ−δ)] / (2 δy)
+
+    δx = R⊕ cos(ϕ) δ π/180,   δy = R⊕ δ π/180
+    """
+    delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH          # scalar (m)
 
     v_xp = _bilinear_interp(v850, clon, clat, lon + DELTA_DEG, lat)
     v_xm = _bilinear_interp(v850, clon, clat, lon - DELTA_DEG, lat)
     u_yp = _bilinear_interp(u850, clon, clat, lon, lat + DELTA_DEG)
     u_ym = _bilinear_interp(u850, clon, clat, lon, lat - DELTA_DEG)
 
-    cos_lat = torch.cos(torch.deg2rad(lat))
-    dx = (cos_lat * delta_m).clamp(min=1.0)
-    dy = delta_m
+    cos_lat = torch.cos(torch.deg2rad(lat))                   # [B, N]
+    dx = (cos_lat * delta_m).clamp(min=1.0)                   # [B, N] (m)
+    dy = delta_m                                               # scalar (m)
 
     return (v_xp - v_xm) / (2.0 * dx) - (u_yp - u_ym) / (2.0 * dy)
 
@@ -1488,12 +771,13 @@ def _parse_era5_uv850(
     """
     Extract u850, v850 at the last observed timestep.
 
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │ BUG 1 FIX: Channel indices corrected to match TCND paper Table 1.1 │
-    │   TCND channels: [SST(0), GPH×4(1-4), U×4(5-8), V×4(9-12)]        │
-    │   U850 = channel 7   (was channel 2 = U500 → WRONG)                │
-    │   V850 = channel 11  (was channel 5 = V200 → WRONG)                │
-    └─────────────────────────────────────────────────────────────────────┘
+    Returns
+    -------
+    u850_last : [B, H, W] or None
+    v850_last : [B, H, W] or None
+    clon      : [B]  storm longitude at last obs (degrees)
+    clat      : [B]  storm latitude  at last obs (degrees)
+    ok        : bool  True if ERA5 was parsed successfully
     """
     obs_traj = batch_list[0]            # [T_obs, B, 2]  normalised
     last     = obs_traj[-1]             # [B, 2]
@@ -1510,23 +794,18 @@ def _parse_era5_uv850(
             return None, None, clon, clat, False
         u = env[u_key]
         v = env[v_key]
+        # Shape [B, T_obs, H, W] or [B, H, W]
         u_last = u[:, -1] if u.dim() == 4 else u
         v_last = v[:, -1] if v.dim() == 4 else v
         return u_last, v_last, clon, clat, True
 
-    # Format B: tensor [B, C, T_obs, H, W]
-    # FIXED: ch7=U850, ch11=V850  (was ch2, ch5)
+    # Format B: tensor [B, C, T_obs, H, W]  (ch2=u850, ch5=v850)
     if isinstance(env, torch.Tensor) and env.dim() == 5:
-        if env.shape[1] > ERA5_CH_V850:
-            return env[:, ERA5_CH_U850, -1], env[:, ERA5_CH_V850, -1], clon, clat, True
-        return None, None, clon, clat, False
+        return env[:, 2, -1], env[:, 5, -1], clon, clat, True
 
     # Format C: tensor [B, C, H, W]
-    # FIXED: ch7=U850, ch11=V850  (was ch2, ch5)
     if isinstance(env, torch.Tensor) and env.dim() == 4:
-        if env.shape[1] > ERA5_CH_V850:
-            return env[:, ERA5_CH_U850], env[:, ERA5_CH_V850], clon, clat, True
-        return None, None, clon, clat, False
+        return env[:, 2], env[:, 5], clon, clat, True
 
     return None, None, clon, clat, False
 
@@ -1534,6 +813,17 @@ def _parse_era5_uv850(
 # ── Velocity Field ─────────────────────────────────────────────────────────────
 
 class VelocityField(nn.Module):
+    """
+    Learned OT-CFM velocity field conditioned on observed track + ERA5 context.
+
+    Architecture
+    ────────────
+    • UNet3D      – spatial encoder for ERA5 image patches
+    • Env_net     – multi-level environmental context encoder
+    • LSTM        – observed track encoder
+    • TransformerDecoder – generates per-step velocity for pred_len steps
+    """
+
     def __init__(
         self,
         pred_len:  int   = 12,
@@ -1546,6 +836,7 @@ class VelocityField(nn.Module):
         self.obs_len   = obs_len
         self.sigma_min = sigma_min
 
+        # Encoders
         self.spatial_enc  = Unet3D(in_channel=1, out_channel=1)
         self.env_enc      = Env_net(obs_len=obs_len, d_model=64)
         self.obs_lstm     = nn.LSTM(
@@ -1554,17 +845,21 @@ class VelocityField(nn.Module):
         )
         self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
 
+        # Context projection
         self.ctx_fc1  = nn.Linear(16 + 64 + 128, 512)
         self.ctx_ln   = nn.LayerNorm(512)
         self.ctx_drop = nn.Dropout(0.15)
         self.ctx_fc2  = nn.Linear(512, ctx_dim)
 
+        # Time embedding projection
         self.time_fc1 = nn.Linear(128, 256)
         self.time_fc2 = nn.Linear(256, 128)
 
+        # Trajectory token embedding + learnable positional encoding
         self.traj_embed = nn.Linear(4, 128)
         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 128) * 0.02)
 
+        # Decoder
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=128, nhead=8, dim_feedforward=512,
@@ -1575,6 +870,7 @@ class VelocityField(nn.Module):
         self.out_fc1 = nn.Linear(128, 256)
         self.out_fc2 = nn.Linear(256, 4)
 
+    # ------------------------------------------------------------------
     def _time_emb(self, t: torch.Tensor, dim: int = 128) -> torch.Tensor:
         half = dim // 2
         freq = torch.exp(
@@ -1586,35 +882,40 @@ class VelocityField(nn.Module):
         return F.pad(emb, (0, 1)) if dim % 2 else emb
 
     def _context(self, batch_list: List) -> torch.Tensor:
-        obs_traj  = batch_list[0]
-        obs_Me    = batch_list[7]
-        image_obs = batch_list[11]
+        obs_traj  = batch_list[0]     # [T_obs, B, 2]
+        obs_Me    = batch_list[7]     # [T_obs, B, 2]
+        image_obs = batch_list[11]    # [B, 1, T_obs, H, W]
         env_data  = batch_list[13]
 
-        f_s = self.spatial_enc(image_obs).mean(dim=2)
-        f_s = self.spatial_pool(f_s).flatten(1)
+        f_s = self.spatial_enc(image_obs).mean(dim=2)   # [B, C, H, W]
+        f_s = self.spatial_pool(f_s).flatten(1)         # [B, 16]
 
-        f_e, _, _ = self.env_enc(env_data, image_obs)
+        f_e, _, _ = self.env_enc(env_data, image_obs)   # [B, 64]
 
-        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
+        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)  # [B, T_obs, 4]
         _, (h_n, _) = self.obs_lstm(obs_in)
-        f_h = h_n[-1]
+        f_h = h_n[-1]                                   # [B, 128]
 
-        ctx = torch.cat([f_s, f_e, f_h], dim=-1)
+        ctx = torch.cat([f_s, f_e, f_h], dim=-1)        # [B, 208]
         ctx = F.gelu(self.ctx_ln(self.ctx_fc1(ctx)))
         ctx = self.ctx_drop(ctx)
-        return self.ctx_fc2(ctx)
+        return self.ctx_fc2(ctx)                         # [B, ctx_dim]
 
-    def forward(self, x_t, t, batch_list):
-        ctx   = self._context(batch_list)
+    def forward(
+        self,
+        x_t:       torch.Tensor,   # [B, T_pred, 4]
+        t:         torch.Tensor,   # [B]
+        batch_list: List,
+    ) -> torch.Tensor:             # [B, T_pred, 4]
+        ctx   = self._context(batch_list)                # [B, 128]
         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
-        t_emb = self.time_fc2(t_emb)
+        t_emb = self.time_fc2(t_emb)                     # [B, 128]
 
-        x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)
-        memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
+        x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)  # [B, T, 128]
+        memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)   # [B, 2, 128]
 
         out = self.transformer(x_emb, memory)
-        return self.out_fc2(F.gelu(self.out_fc1(out)))
+        return self.out_fc2(F.gelu(self.out_fc1(out)))   # [B, T, 4]
 
 
 # ── TCFlowMatching ─────────────────────────────────────────────────────────────
@@ -1623,9 +924,17 @@ class TCFlowMatching(nn.Module):
     """
     Tropical cyclone trajectory prediction via Optimal-Transport CFM
     with physics-informed auxiliary losses.
+
+    Loss weights follow Eq. (60) exactly.
     """
 
-    def __init__(self, pred_len=12, obs_len=8, sigma_min=0.02, **kwargs):
+    def __init__(
+        self,
+        pred_len:  int   = 12,
+        obs_len:   int   = 8,
+        sigma_min: float = 0.02,
+        **kwargs,
+    ):
         super().__init__()
         self.pred_len  = pred_len
         self.obs_len   = obs_len
@@ -1635,90 +944,160 @@ class TCFlowMatching(nn.Module):
     # ── Coordinate encoding ────────────────────────────────────────────────────
 
     @staticmethod
-    def traj_to_rel(traj_gt, Me_gt, last_pos, last_Me):
+    def traj_to_rel(
+        traj_gt:  torch.Tensor,   # [T, B, 2]
+        Me_gt:    torch.Tensor,   # [T, B, 2]
+        last_pos: torch.Tensor,   # [B, 2]
+        last_Me:  torch.Tensor,   # [B, 2]
+    ) -> torch.Tensor:            # [B, T, 4]
         """Encode as absolute offset from last observed position."""
-        return torch.cat(
-            [traj_gt - last_pos.unsqueeze(0), Me_gt - last_Me.unsqueeze(0)],
-            dim=-1,
-        ).permute(1, 0, 2)   # [B, T, 4]
+        traj_enc = traj_gt - last_pos.unsqueeze(0)
+        me_enc   = Me_gt   - last_Me.unsqueeze(0)
+        return torch.cat([traj_enc, me_enc], dim=-1).permute(1, 0, 2)
 
     @staticmethod
-    def rel_to_abs(rel, last_pos, last_Me):
-        """Decode offset → absolute normalised coordinates."""
-        d = rel.permute(1, 0, 2)
-        return last_pos.unsqueeze(0) + d[:, :, :2], last_Me.unsqueeze(0) + d[:, :, 2:]
+    def rel_to_abs(
+        rel:      torch.Tensor,   # [B, T, 4]
+        last_pos: torch.Tensor,   # [B, 2]
+        last_Me:  torch.Tensor,   # [B, 2]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode offset encoding → absolute normalised coordinates."""
+        d    = rel.permute(1, 0, 2)                  # [T, B, 4]
+        traj = last_pos.unsqueeze(0) + d[:, :, :2]   # [T, B, 2]
+        me   = last_Me.unsqueeze(0)  + d[:, :, 2:]   # [T, B, 2]
+        return traj, me
 
-    # ── Auxiliary losses ───────────────────────────────────────────────────────
+    # ── L2: Overall direction loss — Eq. (62) ─────────────────────────────────
 
-    def _overall_dir_loss(self, pred_abs, gt_abs, last_pos):
-        """L2: overall direction cosine — Eq. (62)"""
-        ref = last_pos.unsqueeze(0)
+    def _overall_dir_loss(
+        self,
+        pred_abs: torch.Tensor,   # [T, B, 2]
+        gt_abs:   torch.Tensor,   # [T, B, 2]
+        last_pos: torch.Tensor,   # [B, 2]
+    ) -> torch.Tensor:
+        """
+        L = 1 − cos( x̂_k − x₀,  x_k − x₀ )   averaged over k=1..T
+        """
+        ref  = last_pos.unsqueeze(0)
+
         p = pred_abs - ref
         g = gt_abs   - ref
+
         pn = p.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         gn = g.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
         return (1.0 - ((p / pn) * (g / gn)).sum(-1)).mean()
 
-    def _step_dir_loss(self, pred_abs, gt_abs):
-        """L3: per-step direction cosine — Eq. (63)"""
+    # ── L3: Step-wise direction loss — Eq. (63) ───────────────────────────────
+
+    def _step_dir_loss(
+        self,
+        pred_abs: torch.Tensor,
+        gt_abs:   torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        L = mean_k( 1 − cos( v̂_k, v_k ) )   where v_k = x_{k+1} − x_k
+        """
         if pred_abs.shape[0] < 2:
             return pred_abs.new_zeros(())
+
         pv = pred_abs[1:] - pred_abs[:-1]
         gv = gt_abs[1:]   - gt_abs[:-1]
+
         pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
         return (1.0 - ((pv / pn) * (gv / gn)).sum(-1)).mean()
 
-    def _disp_loss(self, pred_abs, gt_abs):
-        """L4: weighted L1 displacement — Eq. (64)"""
+    # ── L4: Displacement loss — Eq. (64) ──────────────────────────────────────
+
+    def _disp_loss(
+        self,
+        pred_abs: torch.Tensor,
+        gt_abs:   torch.Tensor,
+    ) -> torch.Tensor:
+        """Weighted L1 displacement; weight increases toward later steps."""
         T = pred_abs.shape[0]
         w = torch.linspace(1.0, 2.5, T, device=pred_abs.device).view(T, 1, 1)
         return (w * (pred_abs - gt_abs).abs()).mean()
 
-    def _heading_loss(self, pred_abs, gt_abs):
-        """L5: signed curvature MSE + wrong-sign penalty — Eq. (65–66)"""
+    # ── L5: Heading change loss — Eq. (65–66) ─────────────────────────────────
+
+    def _heading_loss(
+        self,
+        pred_abs: torch.Tensor,
+        gt_abs:   torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Signed curvature:  κ_k = cross(v_{k+1}, v_k) / (|v_{k+1}| |v_k|)
+
+        L = mean_k[ (κ̂_k − κ_k)²  +  ReLU(−κ̂_k · κ_k) ]
+
+        The ReLU term penalises wrong-direction turns.
+        """
         if pred_abs.shape[0] < 3:
             return pred_abs.new_zeros(())
-        pv = pred_abs[1:] - pred_abs[:-1]
+
+        pv = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
         gv = gt_abs[1:]   - gt_abs[:-1]
 
-        def curvature(v):
+        def curvature(v: torch.Tensor) -> torch.Tensor:
+            # cross(v[t+1], v[t]) = vx[t+1]*vy[t] − vy[t+1]*vx[t]
             cross = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
-            n1 = v[1:].norm(dim=-1).clamp(min=1e-6)
-            n2 = v[:-1].norm(dim=-1).clamp(min=1e-6)
-            return cross / (n1 * n2)
+            n1    = v[1:].norm(dim=-1).clamp(min=1e-6)
+            n2    = v[:-1].norm(dim=-1).clamp(min=1e-6)
+            return cross / (n1 * n2)                         # [T-2, B]
 
         pc = curvature(pv)
         gc = curvature(gv)
+
         return F.mse_loss(pc, gc) + F.relu(-(pc * gc)).mean()
 
-    def _smooth_loss(self, traj_abs):
-        """L6: discrete acceleration L2 — Eq. (67)"""
+    # ── L6: Smoothness loss — Eq. (67) ────────────────────────────────────────
+
+    def _smooth_loss(self, traj_abs: torch.Tensor) -> torch.Tensor:
+        """
+        L = mean_k ‖x_{k+1} − 2x_k + x_{k−1}‖²
+        Discrete second derivative (acceleration) — zero for straight lines.
+        """
         if traj_abs.shape[0] < 3:
             return traj_abs.new_zeros(())
         acc = traj_abs[2:] - 2.0 * traj_abs[1:-1] + traj_abs[:-2]
         return (acc ** 2).mean()
 
-    def _pinn_loss(self, pred_abs, batch_list):
+    # ── L7: PINN (BVE) loss — Eq. (43–45) ─────────────────────────────────────
+
+    def _pinn_loss(
+        self,
+        pred_abs:  torch.Tensor,   # [T, B, 2]  normalised
+        batch_list: List,
+    ) -> torch.Tensor:
         """
-        L7: Barotropic Vorticity Equation — Eq. (43–45).
-        r_k = ∂ζ/∂t + u_k·∂ζ/∂x + v_k·∂ζ/∂y ≈ 0
-        Falls back to simplified BVE if ERA5 unavailable.
+        Barotropic Vorticity Equation residual:
+            r_k = ∂ζ/∂t  +  u_k · ∂ζ/∂x  +  v_k · ∂ζ/∂y  ≈ 0
+
+        u_k, v_k — storm velocity from track  (centered diff, Eq. 40–41)
+        ζ        — ERA5 relative vorticity at storm position  (Eq. 43)
+        ∂ζ/∂t    — centred time difference of ζ  (Eq. 44a)
+        ∂ζ/∂x/y  — centred spatial difference of ζ  (Eq. 44b–c)
         """
         T = pred_abs.shape[0]
         if T < 4:
             return pred_abs.new_zeros(())
 
+        # Degrees
         lon = pred_abs[..., 0] * NORM_TO_DEG + 180.0   # [T, B]
         lat = pred_abs[..., 1] * NORM_TO_DEG            # [T, B]
 
-        # Storm velocity (centered diff)
-        dlon_rad = (lon[2:] - lon[:-2]) * (math.pi / 180.0)
-        dlat_rad = (lat[2:] - lat[:-2]) * (math.pi / 180.0)
-        cos_lat  = torch.cos(torch.deg2rad(lat[1:-1]))
-        u_k = R_EARTH * cos_lat * dlon_rad / (2.0 * DT_6H)
-        v_k = R_EARTH           * dlat_rad / (2.0 * DT_6H)
+        # ── Storm velocity u_k, v_k (m s⁻¹) — interior k=1..T-2 ──────────────
+        dlon_rad = (lon[2:] - lon[:-2]) * (math.pi / 180.0)   # [T-2, B]
+        dlat_rad = (lat[2:] - lat[:-2]) * (math.pi / 180.0)   # [T-2, B]
+        cos_lat  = torch.cos(torch.deg2rad(lat[1:-1]))         # [T-2, B]
 
+        u_k = R_EARTH * cos_lat * dlon_rad / (2.0 * DT_6H)    # [T-2, B]
+        v_k = R_EARTH           * dlat_rad / (2.0 * DT_6H)    # [T-2, B]
+
+        # ── Try ERA5 ──────────────────────────────────────────────────────────
         u850, v850, clon, clat, era5_ok = _parse_era5_uv850(batch_list)
 
         if not era5_ok:
@@ -1730,20 +1109,24 @@ class TCFlowMatching(nn.Module):
         clon = clon.to(device)
         clat = clat.to(device)
 
+        # ── ζ at every predicted step — [B, T] then → [T, B] ─────────────────
         lon_BT = lon.permute(1, 0)   # [B, T]
-        lat_BT = lat.permute(1, 0)
+        lat_BT = lat.permute(1, 0)   # [B, T]
 
         zeta_BT = _vorticity_era5(u850, v850, clon, clat, lon_BT, lat_BT)
         zeta    = zeta_BT.permute(1, 0)   # [T, B]
 
-        dzeta_dt = (zeta[2:] - zeta[:-2]) / (2.0 * DT_6H)
+        # ── ∂ζ/∂t  (centred, s⁻²) ─────────────────────────────────────────────
+        # Interior k=1..T-2
+        dzeta_dt = (zeta[2:] - zeta[:-2]) / (2.0 * DT_6H)    # [T-2, B]
 
-        lon_int = lon_BT[:, 1:-1]
-        lat_int = lat_BT[:, 1:-1]
-        delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH
+        # ── ∂ζ/∂x, ∂ζ/∂y  (centred spatial diff, m⁻¹ s⁻¹) ──────────────────
+        lon_int = lon_BT[:, 1:-1]   # [B, T-2]
+        lat_int = lat_BT[:, 1:-1]   # [B, T-2]
+        delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH        # (m)
 
         zeta_xp = _vorticity_era5(u850, v850, clon, clat,
-                                   lon_int + DELTA_DEG, lat_int).permute(1, 0)
+                                   lon_int + DELTA_DEG, lat_int).permute(1, 0)  # [T-2, B]
         zeta_xm = _vorticity_era5(u850, v850, clon, clat,
                                    lon_int - DELTA_DEG, lat_int).permute(1, 0)
         zeta_yp = _vorticity_era5(u850, v850, clon, clat,
@@ -1751,70 +1134,77 @@ class TCFlowMatching(nn.Module):
         zeta_ym = _vorticity_era5(u850, v850, clon, clat,
                                    lon_int, lat_int - DELTA_DEG).permute(1, 0)
 
-        cos_int  = torch.cos(torch.deg2rad(lat[1:-1]))
-        dx       = (cos_int * delta_m).clamp(min=1.0)
-        dy       = delta_m
-        dzeta_dx = (zeta_xp - zeta_xm) / (2.0 * dx)
-        dzeta_dy = (zeta_yp - zeta_ym) / (2.0 * dy)
+        cos_int = torch.cos(torch.deg2rad(lat[1:-1]))           # [T-2, B]
+        dx = (cos_int * delta_m).clamp(min=1.0)                 # [T-2, B]
+        dy = delta_m
 
-        residual = dzeta_dt + u_k * dzeta_dx + v_k * dzeta_dy
+        dzeta_dx = (zeta_xp - zeta_xm) / (2.0 * dx)            # [T-2, B]
+        dzeta_dy = (zeta_yp - zeta_ym) / (2.0 * dy)            # [T-2, B]
+
+        # ── BVE residual  r_k = ∂ζ/∂t + u·∂ζ/∂x + v·∂ζ/∂y — Eq. (44) ───────
+        residual = dzeta_dt + u_k * dzeta_dx + v_k * dzeta_dy   # [T-2, B]
+
+        # ── L_PINN = (1/N) Σ r_k²  — Eq. (45) ───────────────────────────────
         return (residual ** 2).mean()
 
     def _pinn_loss_simplified(self, pred_abs: torch.Tensor) -> torch.Tensor:
         """
-        Fallback BVE: ∂ζ/∂t + β·v ≈ 0 in normalised coordinates.
-
-        ┌──────────────────────────────────────────────────────────────┐
-        │ BUG 2 FIX: Multiply by PINN_SIMPLIFIED_SCALE = 100          │
-        │ Velocity in norm coords is ~0.05 norm/step (~1–3 m/s)       │
-        │ → zeta ~0.0025, residual² ~1e-4, mean ~0.0005               │
-        │ Target pinn_loss ~0.05 (báo cáo Table 7)                    │
-        │ Scale × 100 → pinn_raw ~0.01–0.1, after weight 0.5 → ~0.05 │
-        └──────────────────────────────────────────────────────────────┘
+        Fallback when ERA5 u/v850 is unavailable.
+        Simplified BVE  ∂ζ/∂t + β v ≈ 0  in normalised coordinates.
+        Provides non-zero, well-scaled gradient without ERA5 data.
         """
+
         T = pred_abs.shape[0]
         if T < 4:
-            return pred_abs.new_zeros(())
+            return pred_abs.new_zeros(1).squeeze()
 
         v  = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
-        vx = v[..., 0]
-        vy = v[..., 1]
+        vx = v[..., 0]                       # [T-1, B]
+        vy = v[..., 1]                       # [T-1, B]
 
-        # Vorticity proxy: ζ[t] = vx[t+1]·vy[t] − vy[t+1]·vx[t]  → [T-2, B]
+        # ζ[t] = vx[t+1]*vy[t] - vy[t+1]*vx[t]  →  [T-2, B]
         zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
 
         if zeta.shape[0] < 2:
-            return pred_abs.new_zeros(())
+            return pred_abs.new_zeros(1).squeeze()
 
-        dzeta = zeta[1:] - zeta[:-1]   # [T-3, B]
+        # Δζ[t] = ζ[t+1] - ζ[t]  →  [T-3, B]
+        dzeta = zeta[1:] - zeta[:-1]
 
-        # β at positions 2..T-2
-        lat_norm = pred_abs[2:T-1, :, 1]
+        # β at positions 2..T-2  →  [T-3, B]
+        # pred_abs[2 : T-1] has shape [T-3, B, 2]
+        lat_norm = pred_abs[2:T-1, :, 1]                          # [T-3, B]
         lat_rad  = lat_norm * NORM_TO_DEG * (math.pi / 180.0)
-        beta_n   = BETA_NORM_FACTOR * torch.cos(lat_rad)   # [T-3, B]
+        beta_n   = BETA_NORM_FACTOR * torch.cos(lat_rad)          # [T-3, B]
 
-        v_y = vy[1:T-2]   # [T-3, B]
+        # v_y at same positions  →  [T-3, B]
+        # v[t] = pred_abs[t+1] - pred_abs[t], so v[1:T-2] aligns with steps 2..T-2
+        v_y = vy[1:T-2]                                           # [T-3, B]
 
-        residual = dzeta + beta_n * v_y
-        return (residual ** 2).mean() * PINN_SIMPLIFIED_SCALE
+        residual = dzeta + beta_n * v_y                           # [T-3, B]
+        return (residual ** 2).mean()
 
     # ── Training loss — Eq. (60) ───────────────────────────────────────────────
 
     def get_loss(self, batch_list: List) -> torch.Tensor:
         """
-        L_total = 1.0·L_FM + 2.0·L_dir + 0.5·L_step
-                + 1.0·L_disp + 2.0·L_heading + 0.2·L_smooth + 0.5·L_PINN
+        L_total = 1.0·L_FM  +  2.0·L_dir  +  0.5·L_step
+                + 1.0·L_disp  +  2.0·L_heading  +  0.2·L_smooth
+                + 0.5·L_PINN
         """
-        traj_gt = batch_list[1]
-        Me_gt   = batch_list[8]
-        obs_t   = batch_list[0]
-        obs_Me  = batch_list[7]
+        traj_gt = batch_list[1]    # [T_pred, B, 2]
+        Me_gt   = batch_list[8]    # [T_pred, B, 2]
+        obs_t   = batch_list[0]    # [T_obs, B, 2]
+        obs_Me  = batch_list[7]    # [T_obs, B, 2]
 
-        B, device = traj_gt.shape[1], traj_gt.device
-        lp, lm    = obs_t[-1], obs_Me[-1]
-        sm        = self.sigma_min
+        B      = traj_gt.shape[1]
+        device = traj_gt.device
+        lp     = obs_t[-1]         # [B, 2]  last observed position
+        lm     = obs_Me[-1]        # [B, 2]
+        sm     = self.sigma_min
 
-        x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)
+        # ── OT-CFM interpolation ───────────────────────────────────────────────
+        x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)  # [B, T, 4]
         x0    = torch.randn_like(x1) * sm
         t     = torch.rand(B, device=device)
         te    = t.view(B, 1, 1)
@@ -1826,22 +1216,31 @@ class TCFlowMatching(nn.Module):
         pred_vel = self.net(x_t, t, batch_list)
         fm_loss  = F.mse_loss(pred_vel, target_vel)
 
-        pred_x1, _ = None, None
-        pred_x1     = x_t + denom * pred_vel
-        pred_abs, _ = self.rel_to_abs(pred_x1, lp, lm)
+        # ── Recover predicted absolute trajectory ──────────────────────────────
+        pred_x1      = x_t + denom * pred_vel
+        pred_abs, _  = self.rel_to_abs(pred_x1, lp, lm)   # [T, B, 2]
 
+        # ── Auxiliary losses ───────────────────────────────────────────────────
+        l_dir     = self._overall_dir_loss(pred_abs, traj_gt, lp)
+        l_step    = self._step_dir_loss(pred_abs, traj_gt)
+        l_disp    = self._disp_loss(pred_abs, traj_gt)
+        l_heading = self._heading_loss(pred_abs, traj_gt)
+        l_smooth  = self._smooth_loss(pred_abs)
+        l_pinn    = self._pinn_loss(pred_abs, batch_list)
+
+        # ── Eq. (60) ───────────────────────────────────────────────────────────
         return (
             1.0 * fm_loss
-          + 2.0 * self._overall_dir_loss(pred_abs, traj_gt, lp)
-          + 0.5 * self._step_dir_loss(pred_abs, traj_gt)
-          + 1.0 * self._disp_loss(pred_abs, traj_gt)
-          + 2.0 * self._heading_loss(pred_abs, traj_gt)
-          + 0.2 * self._smooth_loss(pred_abs)
-          + 0.5 * self._pinn_loss(pred_abs, batch_list)
+          + 2.0 * l_dir
+          + 0.5 * l_step
+          + 1.0 * l_disp
+          + 2.0 * l_heading
+          + 0.2 * l_smooth
+          + 0.5 * l_pinn
         )
 
     def get_loss_breakdown(self, batch_list: List) -> dict:
-        """Same as get_loss() but returns individual component values for logging."""
+        """Same as get_loss() but also returns individual component values for logging."""
         traj_gt = batch_list[1]
         Me_gt   = batch_list[8]
         obs_t   = batch_list[0]
@@ -1856,10 +1255,20 @@ class TCFlowMatching(nn.Module):
         t     = torch.rand(B, device=device)
         te    = t.view(B, 1, 1)
 
-        x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
-        denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
-        target_vel = (x1 - (1.0 - sm) * x_t) / denom
+        # x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
+        # denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
+        # target_vel = (x1 - (1.0 - sm) * x_t) / denom
 
+        # OT-CFM interpolation (Tong et al. 2024, Eq.51 báo cáo đã cập nhật)
+        # x_t = t*x1 + (1 - t*(1-sigma_min))*x0
+        # Khác với FM thuần (sigma_min=0): thêm sigma_min để source distribution
+        # không collapse, giúp training ổn định với dataset nhỏ (N=2196).
+        # sigma_min=0.02 (v7) thay vì 0.001 (v4) để tránh near-deterministic paths.
+        x_t   = te * x1 + (1.0 - te * (1.0 - self.sigma_min)) * x0
+        denom = (1.0 - (1.0 - self.sigma_min) * te).clamp(min=1e-5)
+        # target velocity = (x1 - (1-sigma_min)*x0) / (1 - (1-sigma_min)*t)
+        target_vel = (x1 - (1.0 - self.sigma_min) * x_t) / denom
+        
         pred_vel = self.net(x_t, t, batch_list)
         fm_loss  = F.mse_loss(pred_vel, target_vel)
 
@@ -1873,15 +1282,8 @@ class TCFlowMatching(nn.Module):
         l_smooth  = self._smooth_loss(pred_abs)
         l_pinn    = self._pinn_loss(pred_abs, batch_list)
 
-        total = (
-            1.0 * fm_loss
-          + 2.0 * l_dir
-          + 0.5 * l_step
-          + 1.0 * l_disp
-          + 2.0 * l_heading
-          + 0.2 * l_smooth
-          + 0.5 * l_pinn
-        )
+        total = (1.0*fm_loss + 2.0*l_dir + 0.5*l_step + 1.0*l_disp
+               + 2.0*l_heading + 0.2*l_smooth + 0.5*l_pinn)
 
         return {
             'total':   total,
@@ -1905,10 +1307,12 @@ class TCFlowMatching(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Euler integration of the learned velocity field.
+
         Returns predicted trajectory [T_pred, B, 2] and intensity [T_pred, B, 2].
+        Clamp offset to ±5 normalised units (≈ 2750 km from last position).
         """
-        lp     = batch_list[0][-1]
-        lm     = batch_list[7][-1]
+        lp     = batch_list[0][-1]    # [B, 2]
+        lm     = batch_list[7][-1]    # [B, 2]
         B      = lp.shape[0]
         device = lp.device
         dt     = 1.0 / ddim_steps
@@ -1934,3 +1338,599 @@ class TCFlowMatching(nn.Module):
 
 # Backward-compatibility alias
 TCDiffusion = TCFlowMatching
+
+# =====  ──────────────────────────────────────────────────────────────────────────────
+# ==   End of TCFlowMatching implementation
+# version 19
+# """
+# TCNM/flow_matching_model.py  ── v7  [FIXED]
+# ============================================
+# OT-CFM flow matching + physics-informed losses for TC trajectory prediction.
+# Loss function follows Eq. (60) exactly as written in the report.
+
+# Loss components:
+#     L1  FM loss          weight 1.0   Eq. (61) — OT-CFM velocity matching
+#     L2  overall_dir      weight 2.0   Eq. (62) — cosine of net displacement
+#     L3  step_dir         weight 0.5   Eq. (63) — per-step direction cosine
+#     L4  displacement     weight 1.0   Eq. (64) — weighted position L1
+#     L5  heading_change   weight 2.0   Eq. (65-66) — signed curvature MSE
+#     L6  smoothness       weight 0.2   Eq. (67) — discrete acceleration L2
+#     L7  PINN (BVE)       weight 0.5   Eq. (43-45) — barotropic vorticity eq.
+
+# BUGS FIXED vs original v7
+# ──────────────────────────
+# BUG 1 │ _parse_era5_uv850: sai channel index cho ERA5 tensor
+#        │ Paper TCND channels: [SST(0), GPH×4(1-4), U×4(5-8), V×4(9-12)]
+#        │ U850 = ch7, V850 = ch11  (không phải ch2, ch5 như code cũ)
+#        │ Hậu quả: ERA5 trả về sai field → vorticity sai → ok có thể False
+#        │ hoặc ra residual sai scale → pinn ≈ 0.0005 thay vì 0.05+
+
+# BUG 2 │ _pinn_loss_simplified: residual² quá nhỏ (~100× bé hơn target)
+#        │ Trong normalized coords, velocity ~0.05 norm/step → zeta ~0.0025
+#        │ → residual² ~1e-4, pinn~0.0005 (báo cáo cần ~0.05)
+#        │ Fix: nhân scale factor PINN_SIMPLIFIED_SCALE = 100.0
+#        │ → pinn_raw ~0.01–0.1, sau weight 0.5 → ~0.005–0.05 ✓
+
+# BUG 3 │ evaluate() trong train.py: num_ensemble=5 → 6452ms/batch
+#        │ 5 ensemble × 10 ODE steps = 50 forward passes mỗi batch
+#        │ Fix: dùng num_ensemble=1 trong training eval loop,
+#        │      giữ num_ensemble=5 chỉ cho final test evaluation
+
+# ERA5 dict format expected (batch_list[13]):
+#     key 'u850' → tensor [B, T_obs, H, W]   zonal wind (m s⁻¹)
+#     key 'v850' → tensor [B, T_obs, H, W]   meridional wind (m s⁻¹)
+#     Grid: 9°×9° centred on storm, 0.25°/pixel.
+#     Accepted alternative: tensor [B, C, T_obs, H, W] with channel
+#     order [SST,GPH×4,U×4,V×4] → U850=ch7, V850=ch11.
+# """
+
+# from __future__ import annotations
+# import math
+# from typing import List, Tuple, Optional
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+# from TCNM.Unet3D_merge_tiny import Unet3D
+# from TCNM.env_net_transformer_gphsplit import Env_net
+
+# # ── Physical constants ─────────────────────────────────────────────────────────
+# OMEGA    = 7.2921e-5   # Earth rotation rate  (rad s⁻¹)
+# R_EARTH  = 6.371e6     # Earth radius         (m)
+# DT_6H    = 6 * 3600    # Timestep             (s)
+
+# # Normalisation: lon_norm*5+180 = lon_deg,  lat_norm*5 = lat_deg
+# NORM_TO_DEG = 5.0
+
+# # ERA5 grid geometry
+# ERA5_RES_DEG  = 0.25   # degrees per pixel
+# DELTA_DEG     = 0.10   # perturbation for finite-difference vorticity (≈11 km)
+
+# NORM_TO_M        = NORM_TO_DEG * 111000.0
+# BETA_NORM_FACTOR = 2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH   # ~0.274
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # BUG 2 FIX: Scale factor for simplified PINN fallback.
+# # Velocity in normalised coords is ~50× smaller than needed to produce
+# # residuals² of the same order as the target pinn ~0.05.
+# # Multiplying by 100 brings the simplified loss into the correct range.
+# # ─────────────────────────────────────────────────────────────────────────────
+# PINN_SIMPLIFIED_SCALE = 100.0
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # TCND Data3d channel order (from paper Table 1.1):
+# #   0        SST
+# #   1–4      GPH @ 200, 500, 850, 925 hPa
+# #   5–8      U   @ 200, 500, 850, 925 hPa   ← U850 = ch 7
+# #   9–12     V   @ 200, 500, 850, 925 hPa   ← V850 = ch 11
+# # ─────────────────────────────────────────────────────────────────────────────
+# ERA5_CH_U850 = 7   # BUG 1 FIX: was 2 (U500) in original code
+# ERA5_CH_V850 = 11  # BUG 1 FIX: was 5 (V200) in original code
+
+
+# # ── ERA5 helpers ───────────────────────────────────────────────────────────────
+
+# def _bilinear_interp(
+#     field:      torch.Tensor,   # [B, H, W]
+#     center_lon: torch.Tensor,   # [B]
+#     center_lat: torch.Tensor,   # [B]
+#     query_lon:  torch.Tensor,   # [B, N]
+#     query_lat:  torch.Tensor,   # [B, N]
+# ) -> torch.Tensor:              # [B, N]
+#     """Differentiable bilinear interpolation of an ERA5 patch."""
+#     H, W = field.shape[-2], field.shape[-1]
+#     half_lon = (W // 2) * ERA5_RES_DEG
+#     half_lat = (H // 2) * ERA5_RES_DEG
+
+#     dlon = query_lon - center_lon.unsqueeze(1)
+#     dlat = query_lat - center_lat.unsqueeze(1)
+
+#     gx = ( dlon / half_lon).clamp(-1.0, 1.0)
+#     gy = (-dlat / half_lat).clamp(-1.0, 1.0)
+
+#     grid = torch.stack([gx, gy], dim=-1).unsqueeze(1)   # [B, 1, N, 2]
+#     out  = F.grid_sample(
+#         field.unsqueeze(1),
+#         grid,
+#         mode='bilinear', padding_mode='border', align_corners=True,
+#     )
+#     return out.squeeze(1).squeeze(1)                     # [B, N]
+
+
+# def _vorticity_era5(
+#     u850: torch.Tensor,   # [B, H, W]
+#     v850: torch.Tensor,   # [B, H, W]
+#     clon: torch.Tensor,   # [B]
+#     clat: torch.Tensor,   # [B]
+#     lon:  torch.Tensor,   # [B, N]
+#     lat:  torch.Tensor,   # [B, N]
+# ) -> torch.Tensor:        # [B, N]
+#     """Relative vorticity ζ = ∂v/∂x − ∂u/∂y via centred finite difference."""
+#     delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH
+
+#     v_xp = _bilinear_interp(v850, clon, clat, lon + DELTA_DEG, lat)
+#     v_xm = _bilinear_interp(v850, clon, clat, lon - DELTA_DEG, lat)
+#     u_yp = _bilinear_interp(u850, clon, clat, lon, lat + DELTA_DEG)
+#     u_ym = _bilinear_interp(u850, clon, clat, lon, lat - DELTA_DEG)
+
+#     cos_lat = torch.cos(torch.deg2rad(lat))
+#     dx = (cos_lat * delta_m).clamp(min=1.0)
+#     dy = delta_m
+
+#     return (v_xp - v_xm) / (2.0 * dx) - (u_yp - u_ym) / (2.0 * dy)
+
+
+# def _parse_era5_uv850(
+#     batch_list: List,
+# ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor],
+#            torch.Tensor, torch.Tensor, bool]:
+#     """
+#     Extract u850, v850 at the last observed timestep.
+
+#     ┌─────────────────────────────────────────────────────────────────────┐
+#     │ BUG 1 FIX: Channel indices corrected to match TCND paper Table 1.1 │
+#     │   TCND channels: [SST(0), GPH×4(1-4), U×4(5-8), V×4(9-12)]        │
+#     │   U850 = channel 7   (was channel 2 = U500 → WRONG)                │
+#     │   V850 = channel 11  (was channel 5 = V200 → WRONG)                │
+#     └─────────────────────────────────────────────────────────────────────┘
+#     """
+#     obs_traj = batch_list[0]            # [T_obs, B, 2]  normalised
+#     last     = obs_traj[-1]             # [B, 2]
+#     clon     = last[:, 0] * NORM_TO_DEG + 180.0
+#     clat     = last[:, 1] * NORM_TO_DEG
+
+#     env = batch_list[13]
+
+#     # Format A: dict with variable keys
+#     if isinstance(env, dict):
+#         u_key = next((k for k in ('u850', 'U850', 'u_850') if k in env), None)
+#         v_key = next((k for k in ('v850', 'V850', 'v_850') if k in env), None)
+#         if u_key is None or v_key is None:
+#             return None, None, clon, clat, False
+#         u = env[u_key]
+#         v = env[v_key]
+#         u_last = u[:, -1] if u.dim() == 4 else u
+#         v_last = v[:, -1] if v.dim() == 4 else v
+#         return u_last, v_last, clon, clat, True
+
+#     # Format B: tensor [B, C, T_obs, H, W]
+#     # FIXED: ch7=U850, ch11=V850  (was ch2, ch5)
+#     if isinstance(env, torch.Tensor) and env.dim() == 5:
+#         if env.shape[1] > ERA5_CH_V850:
+#             return env[:, ERA5_CH_U850, -1], env[:, ERA5_CH_V850, -1], clon, clat, True
+#         return None, None, clon, clat, False
+
+#     # Format C: tensor [B, C, H, W]
+#     # FIXED: ch7=U850, ch11=V850  (was ch2, ch5)
+#     if isinstance(env, torch.Tensor) and env.dim() == 4:
+#         if env.shape[1] > ERA5_CH_V850:
+#             return env[:, ERA5_CH_U850], env[:, ERA5_CH_V850], clon, clat, True
+#         return None, None, clon, clat, False
+
+#     return None, None, clon, clat, False
+
+
+# # ── Velocity Field ─────────────────────────────────────────────────────────────
+
+# class VelocityField(nn.Module):
+#     def __init__(
+#         self,
+#         pred_len:  int   = 12,
+#         obs_len:   int   = 8,
+#         ctx_dim:   int   = 128,
+#         sigma_min: float = 0.02,
+#     ):
+#         super().__init__()
+#         self.pred_len  = pred_len
+#         self.obs_len   = obs_len
+#         self.sigma_min = sigma_min
+
+#         self.spatial_enc  = Unet3D(in_channel=1, out_channel=1)
+#         self.env_enc      = Env_net(obs_len=obs_len, d_model=64)
+#         self.obs_lstm     = nn.LSTM(
+#             input_size=4, hidden_size=128, num_layers=3,
+#             batch_first=True, dropout=0.2,
+#         )
+#         self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
+
+#         self.ctx_fc1  = nn.Linear(16 + 64 + 128, 512)
+#         self.ctx_ln   = nn.LayerNorm(512)
+#         self.ctx_drop = nn.Dropout(0.15)
+#         self.ctx_fc2  = nn.Linear(512, ctx_dim)
+
+#         self.time_fc1 = nn.Linear(128, 256)
+#         self.time_fc2 = nn.Linear(256, 128)
+
+#         self.traj_embed = nn.Linear(4, 128)
+#         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 128) * 0.02)
+
+#         self.transformer = nn.TransformerDecoder(
+#             nn.TransformerDecoderLayer(
+#                 d_model=128, nhead=8, dim_feedforward=512,
+#                 dropout=0.15, activation='gelu', batch_first=True,
+#             ),
+#             num_layers=4,
+#         )
+#         self.out_fc1 = nn.Linear(128, 256)
+#         self.out_fc2 = nn.Linear(256, 4)
+
+#     def _time_emb(self, t: torch.Tensor, dim: int = 128) -> torch.Tensor:
+#         half = dim // 2
+#         freq = torch.exp(
+#             torch.arange(half, dtype=torch.float32, device=t.device)
+#             * (-math.log(10000.0) / (half - 1))
+#         )
+#         emb = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
+#         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+#         return F.pad(emb, (0, 1)) if dim % 2 else emb
+
+#     def _context(self, batch_list: List) -> torch.Tensor:
+#         obs_traj  = batch_list[0]
+#         obs_Me    = batch_list[7]
+#         image_obs = batch_list[11]
+#         env_data  = batch_list[13]
+
+#         f_s = self.spatial_enc(image_obs).mean(dim=2)
+#         f_s = self.spatial_pool(f_s).flatten(1)
+
+#         f_e, _, _ = self.env_enc(env_data, image_obs)
+
+#         obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
+#         _, (h_n, _) = self.obs_lstm(obs_in)
+#         f_h = h_n[-1]
+
+#         ctx = torch.cat([f_s, f_e, f_h], dim=-1)
+#         ctx = F.gelu(self.ctx_ln(self.ctx_fc1(ctx)))
+#         ctx = self.ctx_drop(ctx)
+#         return self.ctx_fc2(ctx)
+
+#     def forward(self, x_t, t, batch_list):
+#         ctx   = self._context(batch_list)
+#         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
+#         t_emb = self.time_fc2(t_emb)
+
+#         x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)
+#         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
+
+#         out = self.transformer(x_emb, memory)
+#         return self.out_fc2(F.gelu(self.out_fc1(out)))
+
+
+# # ── TCFlowMatching ─────────────────────────────────────────────────────────────
+
+# class TCFlowMatching(nn.Module):
+#     """
+#     Tropical cyclone trajectory prediction via Optimal-Transport CFM
+#     with physics-informed auxiliary losses.
+#     """
+
+#     def __init__(self, pred_len=12, obs_len=8, sigma_min=0.02, **kwargs):
+#         super().__init__()
+#         self.pred_len  = pred_len
+#         self.obs_len   = obs_len
+#         self.sigma_min = sigma_min
+#         self.net       = VelocityField(pred_len, obs_len, sigma_min=sigma_min)
+
+#     # ── Coordinate encoding ────────────────────────────────────────────────────
+
+#     @staticmethod
+#     def traj_to_rel(traj_gt, Me_gt, last_pos, last_Me):
+#         """Encode as absolute offset from last observed position."""
+#         return torch.cat(
+#             [traj_gt - last_pos.unsqueeze(0), Me_gt - last_Me.unsqueeze(0)],
+#             dim=-1,
+#         ).permute(1, 0, 2)   # [B, T, 4]
+
+#     @staticmethod
+#     def rel_to_abs(rel, last_pos, last_Me):
+#         """Decode offset → absolute normalised coordinates."""
+#         d = rel.permute(1, 0, 2)
+#         return last_pos.unsqueeze(0) + d[:, :, :2], last_Me.unsqueeze(0) + d[:, :, 2:]
+
+#     # ── Auxiliary losses ───────────────────────────────────────────────────────
+
+#     def _overall_dir_loss(self, pred_abs, gt_abs, last_pos):
+#         """L2: overall direction cosine — Eq. (62)"""
+#         ref = last_pos.unsqueeze(0)
+#         p = pred_abs - ref
+#         g = gt_abs   - ref
+#         pn = p.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#         gn = g.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#         return (1.0 - ((p / pn) * (g / gn)).sum(-1)).mean()
+
+#     def _step_dir_loss(self, pred_abs, gt_abs):
+#         """L3: per-step direction cosine — Eq. (63)"""
+#         if pred_abs.shape[0] < 2:
+#             return pred_abs.new_zeros(())
+#         pv = pred_abs[1:] - pred_abs[:-1]
+#         gv = gt_abs[1:]   - gt_abs[:-1]
+#         pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#         gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#         return (1.0 - ((pv / pn) * (gv / gn)).sum(-1)).mean()
+
+#     def _disp_loss(self, pred_abs, gt_abs):
+#         """L4: weighted L1 displacement — Eq. (64)"""
+#         T = pred_abs.shape[0]
+#         w = torch.linspace(1.0, 2.5, T, device=pred_abs.device).view(T, 1, 1)
+#         return (w * (pred_abs - gt_abs).abs()).mean()
+
+#     def _heading_loss(self, pred_abs, gt_abs):
+#         """L5: signed curvature MSE + wrong-sign penalty — Eq. (65–66)"""
+#         if pred_abs.shape[0] < 3:
+#             return pred_abs.new_zeros(())
+#         pv = pred_abs[1:] - pred_abs[:-1]
+#         gv = gt_abs[1:]   - gt_abs[:-1]
+
+#         def curvature(v):
+#             cross = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
+#             n1 = v[1:].norm(dim=-1).clamp(min=1e-6)
+#             n2 = v[:-1].norm(dim=-1).clamp(min=1e-6)
+#             return cross / (n1 * n2)
+
+#         pc = curvature(pv)
+#         gc = curvature(gv)
+#         return F.mse_loss(pc, gc) + F.relu(-(pc * gc)).mean()
+
+#     def _smooth_loss(self, traj_abs):
+#         """L6: discrete acceleration L2 — Eq. (67)"""
+#         if traj_abs.shape[0] < 3:
+#             return traj_abs.new_zeros(())
+#         acc = traj_abs[2:] - 2.0 * traj_abs[1:-1] + traj_abs[:-2]
+#         return (acc ** 2).mean()
+
+#     def _pinn_loss(self, pred_abs, batch_list):
+#         """
+#         L7: Barotropic Vorticity Equation — Eq. (43–45).
+#         r_k = ∂ζ/∂t + u_k·∂ζ/∂x + v_k·∂ζ/∂y ≈ 0
+#         Falls back to simplified BVE if ERA5 unavailable.
+#         """
+#         T = pred_abs.shape[0]
+#         if T < 4:
+#             return pred_abs.new_zeros(())
+
+#         lon = pred_abs[..., 0] * NORM_TO_DEG + 180.0   # [T, B]
+#         lat = pred_abs[..., 1] * NORM_TO_DEG            # [T, B]
+
+#         # Storm velocity (centered diff)
+#         dlon_rad = (lon[2:] - lon[:-2]) * (math.pi / 180.0)
+#         dlat_rad = (lat[2:] - lat[:-2]) * (math.pi / 180.0)
+#         cos_lat  = torch.cos(torch.deg2rad(lat[1:-1]))
+#         u_k = R_EARTH * cos_lat * dlon_rad / (2.0 * DT_6H)
+#         v_k = R_EARTH           * dlat_rad / (2.0 * DT_6H)
+
+#         u850, v850, clon, clat, era5_ok = _parse_era5_uv850(batch_list)
+
+#         if not era5_ok:
+#             return self._pinn_loss_simplified(pred_abs)
+
+#         device = pred_abs.device
+#         u850 = u850.to(device)
+#         v850 = v850.to(device)
+#         clon = clon.to(device)
+#         clat = clat.to(device)
+
+#         lon_BT = lon.permute(1, 0)   # [B, T]
+#         lat_BT = lat.permute(1, 0)
+
+#         zeta_BT = _vorticity_era5(u850, v850, clon, clat, lon_BT, lat_BT)
+#         zeta    = zeta_BT.permute(1, 0)   # [T, B]
+
+#         dzeta_dt = (zeta[2:] - zeta[:-2]) / (2.0 * DT_6H)
+
+#         lon_int = lon_BT[:, 1:-1]
+#         lat_int = lat_BT[:, 1:-1]
+#         delta_m = DELTA_DEG * math.pi / 180.0 * R_EARTH
+
+#         zeta_xp = _vorticity_era5(u850, v850, clon, clat,
+#                                    lon_int + DELTA_DEG, lat_int).permute(1, 0)
+#         zeta_xm = _vorticity_era5(u850, v850, clon, clat,
+#                                    lon_int - DELTA_DEG, lat_int).permute(1, 0)
+#         zeta_yp = _vorticity_era5(u850, v850, clon, clat,
+#                                    lon_int, lat_int + DELTA_DEG).permute(1, 0)
+#         zeta_ym = _vorticity_era5(u850, v850, clon, clat,
+#                                    lon_int, lat_int - DELTA_DEG).permute(1, 0)
+
+#         cos_int  = torch.cos(torch.deg2rad(lat[1:-1]))
+#         dx       = (cos_int * delta_m).clamp(min=1.0)
+#         dy       = delta_m
+#         dzeta_dx = (zeta_xp - zeta_xm) / (2.0 * dx)
+#         dzeta_dy = (zeta_yp - zeta_ym) / (2.0 * dy)
+
+#         residual = dzeta_dt + u_k * dzeta_dx + v_k * dzeta_dy
+#         return (residual ** 2).mean()
+
+#     def _pinn_loss_simplified(self, pred_abs: torch.Tensor) -> torch.Tensor:
+#         """
+#         Fallback BVE: ∂ζ/∂t + β·v ≈ 0 in normalised coordinates.
+
+#         ┌──────────────────────────────────────────────────────────────┐
+#         │ BUG 2 FIX: Multiply by PINN_SIMPLIFIED_SCALE = 100          │
+#         │ Velocity in norm coords is ~0.05 norm/step (~1–3 m/s)       │
+#         │ → zeta ~0.0025, residual² ~1e-4, mean ~0.0005               │
+#         │ Target pinn_loss ~0.05 (báo cáo Table 7)                    │
+#         │ Scale × 100 → pinn_raw ~0.01–0.1, after weight 0.5 → ~0.05 │
+#         └──────────────────────────────────────────────────────────────┘
+#         """
+#         T = pred_abs.shape[0]
+#         if T < 4:
+#             return pred_abs.new_zeros(())
+
+#         v  = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
+#         vx = v[..., 0]
+#         vy = v[..., 1]
+
+#         # Vorticity proxy: ζ[t] = vx[t+1]·vy[t] − vy[t+1]·vx[t]  → [T-2, B]
+#         zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
+
+#         if zeta.shape[0] < 2:
+#             return pred_abs.new_zeros(())
+
+#         dzeta = zeta[1:] - zeta[:-1]   # [T-3, B]
+
+#         # β at positions 2..T-2
+#         lat_norm = pred_abs[2:T-1, :, 1]
+#         lat_rad  = lat_norm * NORM_TO_DEG * (math.pi / 180.0)
+#         beta_n   = BETA_NORM_FACTOR * torch.cos(lat_rad)   # [T-3, B]
+
+#         v_y = vy[1:T-2]   # [T-3, B]
+
+#         residual = dzeta + beta_n * v_y
+#         return (residual ** 2).mean() * PINN_SIMPLIFIED_SCALE
+
+#     # ── Training loss — Eq. (60) ───────────────────────────────────────────────
+
+#     def get_loss(self, batch_list: List) -> torch.Tensor:
+#         """
+#         L_total = 1.0·L_FM + 2.0·L_dir + 0.5·L_step
+#                 + 1.0·L_disp + 2.0·L_heading + 0.2·L_smooth + 0.5·L_PINN
+#         """
+#         traj_gt = batch_list[1]
+#         Me_gt   = batch_list[8]
+#         obs_t   = batch_list[0]
+#         obs_Me  = batch_list[7]
+
+#         B, device = traj_gt.shape[1], traj_gt.device
+#         lp, lm    = obs_t[-1], obs_Me[-1]
+#         sm        = self.sigma_min
+
+#         x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)
+#         x0    = torch.randn_like(x1) * sm
+#         t     = torch.rand(B, device=device)
+#         te    = t.view(B, 1, 1)
+
+#         x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
+#         denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
+#         target_vel = (x1 - (1.0 - sm) * x_t) / denom
+
+#         pred_vel = self.net(x_t, t, batch_list)
+#         fm_loss  = F.mse_loss(pred_vel, target_vel)
+
+#         pred_x1, _ = None, None
+#         pred_x1     = x_t + denom * pred_vel
+#         pred_abs, _ = self.rel_to_abs(pred_x1, lp, lm)
+
+#         return (
+#             1.0 * fm_loss
+#           + 2.0 * self._overall_dir_loss(pred_abs, traj_gt, lp)
+#           + 0.5 * self._step_dir_loss(pred_abs, traj_gt)
+#           + 1.0 * self._disp_loss(pred_abs, traj_gt)
+#           + 2.0 * self._heading_loss(pred_abs, traj_gt)
+#           + 0.2 * self._smooth_loss(pred_abs)
+#           + 0.5 * self._pinn_loss(pred_abs, batch_list)
+#         )
+
+#     def get_loss_breakdown(self, batch_list: List) -> dict:
+#         """Same as get_loss() but returns individual component values for logging."""
+#         traj_gt = batch_list[1]
+#         Me_gt   = batch_list[8]
+#         obs_t   = batch_list[0]
+#         obs_Me  = batch_list[7]
+
+#         B, device = traj_gt.shape[1], traj_gt.device
+#         lp, lm    = obs_t[-1], obs_Me[-1]
+#         sm        = self.sigma_min
+
+#         x1    = self.traj_to_rel(traj_gt, Me_gt, lp, lm)
+#         x0    = torch.randn_like(x1) * sm
+#         t     = torch.rand(B, device=device)
+#         te    = t.view(B, 1, 1)
+
+#         x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
+#         denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
+#         target_vel = (x1 - (1.0 - sm) * x_t) / denom
+
+#         pred_vel = self.net(x_t, t, batch_list)
+#         fm_loss  = F.mse_loss(pred_vel, target_vel)
+
+#         pred_x1     = x_t + denom * pred_vel
+#         pred_abs, _ = self.rel_to_abs(pred_x1, lp, lm)
+
+#         l_dir     = self._overall_dir_loss(pred_abs, traj_gt, lp)
+#         l_step    = self._step_dir_loss(pred_abs, traj_gt)
+#         l_disp    = self._disp_loss(pred_abs, traj_gt)
+#         l_heading = self._heading_loss(pred_abs, traj_gt)
+#         l_smooth  = self._smooth_loss(pred_abs)
+#         l_pinn    = self._pinn_loss(pred_abs, batch_list)
+
+#         total = (
+#             1.0 * fm_loss
+#           + 2.0 * l_dir
+#           + 0.5 * l_step
+#           + 1.0 * l_disp
+#           + 2.0 * l_heading
+#           + 0.2 * l_smooth
+#           + 0.5 * l_pinn
+#         )
+
+#         return {
+#             'total':   total,
+#             'fm':      fm_loss.item(),
+#             'dir':     l_dir.item(),
+#             'step':    l_step.item(),
+#             'disp':    l_disp.item(),
+#             'heading': l_heading.item(),
+#             'smooth':  l_smooth.item(),
+#             'pinn':    l_pinn.item(),
+#         }
+
+#     # ── Inference ──────────────────────────────────────────────────────────────
+
+#     @torch.no_grad()
+#     def sample(
+#         self,
+#         batch_list:   List,
+#         num_ensemble: int = 5,
+#         ddim_steps:   int = 10,
+#     ) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """
+#         Euler integration of the learned velocity field.
+#         Returns predicted trajectory [T_pred, B, 2] and intensity [T_pred, B, 2].
+#         """
+#         lp     = batch_list[0][-1]
+#         lm     = batch_list[7][-1]
+#         B      = lp.shape[0]
+#         device = lp.device
+#         dt     = 1.0 / ddim_steps
+
+#         traj_samples = []
+#         me_samples   = []
+
+#         for _ in range(num_ensemble):
+#             x_t = torch.randn(B, self.pred_len, 4, device=device) * self.sigma_min
+#             for i in range(ddim_steps):
+#                 t_b = torch.full((B,), i * dt, device=device)
+#                 x_t = x_t + dt * self.net(x_t, t_b, batch_list)
+#                 x_t[:, :, :2].clamp_(-5.0, 5.0)
+#             traj, me = self.rel_to_abs(x_t, lp, lm)
+#             traj_samples.append(traj)
+#             me_samples.append(me)
+
+#         return (
+#             torch.stack(traj_samples).mean(0),
+#             torch.stack(me_samples).mean(0),
+#         )
+
+
+# # Backward-compatibility alias
+# TCDiffusion = TCFlowMatching
