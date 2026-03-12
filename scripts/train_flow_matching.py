@@ -1300,11 +1300,24 @@ def evaluate(
             total_ms += (time.perf_counter() - t0) * 1e3
             n_batches += 1
 
+            # pred_deg = denorm_to_deg(pred)
+            # gt_deg   = denorm_to_deg(gt)
+            # dist_km  = pred_deg.sub(gt_deg).norm(dim=-1).mul(11.1)  # [T, B]
+            # step_errors.append(dist_km.mean(dim=1).cpu())            # [T]
+
             pred_deg = denorm_to_deg(pred)
             gt_deg   = denorm_to_deg(gt)
-            dist_km  = pred_deg.sub(gt_deg).norm(dim=-1).mul(11.1)  # [T, B]
-            step_errors.append(dist_km.mean(dim=1).cpu())            # [T]
 
+            # Haversine distance (degrees → km)
+            lat1 = torch.deg2rad(pred_deg[..., 1])
+            lat2 = torch.deg2rad(gt_deg[..., 1])
+            dlat = torch.deg2rad(gt_deg[..., 1] - pred_deg[..., 1])
+            dlon = torch.deg2rad(gt_deg[..., 0] - pred_deg[..., 0])
+            a    = torch.sin(dlat / 2) ** 2 + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2
+            dist_km = 2 * 6371.0 * torch.asin(torch.clamp(torch.sqrt(a), 0.0, 1.0))  # [T, B]
+
+            step_errors.append(dist_km.mean(dim=1).cpu())
+                
     mean_steps = torch.stack(step_errors).mean(dim=0)  # [T_pred]
 
     m = {
