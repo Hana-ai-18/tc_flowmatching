@@ -1263,7 +1263,7 @@ class TCFlowMatching(nn.Module):
         x_t   = te * x1 + (1.0 - te * (1.0 - self.sigma_min)) * x0
         denom = (1.0 - (1.0 - self.sigma_min) * te).clamp(min=1e-5)
         # target velocity = (x1 - (1-sigma_min)*x0) / (1 - (1-sigma_min)*t)
-        target_vel = (x1 - (1.0 - self.sigma_min) * x0) / denom
+        target_vel = (x1 - (1.0 - self.sigma_min) * x_t) / denom
         
         pred_vel = self.net(x_t, t, batch_list)
         fm_loss  = F.mse_loss(pred_vel, target_vel)
