@@ -1263,10 +1263,16 @@ def move_to(batch, device: torch.device):
 
 
 def denorm_to_deg(t: torch.Tensor) -> torch.Tensor:
-    """Normalised → degrees:  lon_norm*5+180, lat_norm*5."""
+    """
+    Chuyển normalized coords → degrees.
+    Normalization (từ TrajectoryDataset):
+        lon_norm = (lon_deg - 180) / 5  →  lon_deg = lon_norm*5 + 180
+        lat_norm = lat_deg / 5          →  lat_deg = lat_norm*5
+    Dải hợp lệ: lon ∈ [100°E, 180°E], lat ∈ [0°N, 40°N] cho WNP/Biển Đông
+    """
     out = t.clone()
-    out[..., 0] = t[..., 0] * 5.0 + 180.0
-    out[..., 1] = t[..., 1] * 5.0
+    out[..., 0] = t[..., 0] * 5.0 + 180.0  # lon
+    out[..., 1] = t[..., 1] * 5.0           # lat
     return out
 
 
@@ -1317,7 +1323,7 @@ def evaluate(
             dist_km = 2 * 6371.0 * torch.asin(torch.clamp(torch.sqrt(a), 0.0, 1.0))  # [T, B]
 
             step_errors.append(dist_km.mean(dim=1).cpu())
-                
+
     mean_steps = torch.stack(step_errors).mean(dim=0)  # [T_pred]
 
     m = {

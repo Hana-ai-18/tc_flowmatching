@@ -1251,10 +1251,20 @@ class TCFlowMatching(nn.Module):
         t     = torch.rand(B, device=device)
         te    = t.view(B, 1, 1)
 
-        x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
-        denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
-        target_vel = (x1 - (1.0 - sm) * x_t) / denom
+        # x_t        = te * x1 + (1.0 - te * (1.0 - sm)) * x0
+        # denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
+        # target_vel = (x1 - (1.0 - sm) * x_t) / denom
 
+        # OT-CFM interpolation (Tong et al. 2024, Eq.51 báo cáo đã cập nhật)
+        # x_t = t*x1 + (1 - t*(1-sigma_min))*x0
+        # Khác với FM thuần (sigma_min=0): thêm sigma_min để source distribution
+        # không collapse, giúp training ổn định với dataset nhỏ (N=2196).
+        # sigma_min=0.02 (v7) thay vì 0.001 (v4) để tránh near-deterministic paths.
+        x_t   = te * x1 + (1.0 - te * (1.0 - self.sigma_min)) * x0
+        denom = (1.0 - (1.0 - self.sigma_min) * te).clamp(min=1e-5)
+        # target velocity = (x1 - (1-sigma_min)*x0) / (1 - (1-sigma_min)*t)
+        target_vel = (x1 - (1.0 - self.sigma_min) * x0) / denom
+        
         pred_vel = self.net(x_t, t, batch_list)
         fm_loss  = F.mse_loss(pred_vel, target_vel)
 

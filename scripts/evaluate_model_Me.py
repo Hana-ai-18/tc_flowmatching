@@ -1,223 +1,374 @@
-"""
-scripts/visual_evaluate_model_Me.py - Fixed visualization
-"""
-import os, sys, random, argparse
-import numpy as np
+# ============================================================
+# evaluate_model_Me.py
+# LEGACY — Dùng cho TropiCycloneNet (SGAN-based, pred_len=4, 24h)
+# KHÔNG dùng cho TCFlowMatching v7
+#
+# Để evaluate TCFlowMatching v7, dùng:
+#   scripts/visual_evaluate_model_Me.py  (đã cập nhật)
+#   hoặc evaluate() trong scripts/train_flowmatching.py
+# ============================================================
+#evaluate_model_Me.py
+import argparse
+import os
 import torch
-import matplotlib.pyplot as plt
-import cv2
-from datetime import datetime, timedelta
+import copy
+import sys
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, project_root)
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(),'..')))
 
-from TCNM.flow_matching_model import TCFlowMatching
-from TCNM.data.loader import data_loader
+from attrdict import AttrDict
 
-
-def set_seed(seed=42):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
-    print(f"🔒 Seed fixed at {seed}")
+from sgan.data.loader import data_loader
+# from sgan.models import TrajectoryGenerator
+from sgan.models_prior_unet import TrajectoryGenerator
+from sgan.losses import displacement_error, final_displacement_error,toNE,trajectory_displacement_error,value_error,trajectory_diff,value_diff
+from sgan.utils import relative_to_abs, get_dset_path,dic2cuda
 
 
-def move_batch(batch, device):
-    out = list(batch)
-    for i, x in enumerate(out):
-        if torch.is_tensor(x):
-            out[i] = x.to(device)
-        elif isinstance(x, dict):
-            out[i] = {k: v.to(device) if torch.is_tensor(v) else v for k, v in x.items()}
-    return tuple(out)
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+# areas = ['WP']
+pt_num = '16000'
+save_ana = False
+test_year = '2023'
+# tensor([23.8483, 45.0369, 67.9328, 95.3904]) tensor([[1.3138, 0.7240],
+#         [2.0427, 1.1541],
+#         [2.5818, 1.4840],
+#         [3.1927, 1.8151]])
+parser = argparse.ArgumentParser()
+parser.add_argument('--model_path',default='model_save/model_name', type=str)
+parser.add_argument('--num_samples', default=6, type=int)
+parser.add_argument('--dset_type', default='test', type=str)
+parser.add_argument('--areas', default=areas, type=str)
+parser.add_argument('--TC_data_path', default=r'path\bst_divi10_train_val_test_inlcude15_2023', type=str)
 
 
-def detect_pred_len(ckpt_path):
-    ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    sd = ck.get('model_state_dict', ck.get('model_state', ck))
-    key = 'denoiser.pos_encoding'
-    if key in sd:
-        return sd[key].shape[1]
-    return 12
+def get_generator(checkpoint):
+    args = AttrDict(checkpoint['args'])
+    generator = TrajectoryGenerator(
+        obs_len=args.obs_len,
+        pred_len=args.pred_len,
+        embedding_dim=args.embedding_dim,
+        encoder_h_dim=args.encoder_h_dim_g,
+        decoder_h_dim=args.decoder_h_dim_g,
+        mlp_dim=args.mlp_dim,
+        num_layers=args.num_layers,
+        noise_dim=args.noise_dim,
+        noise_type=args.noise_type,
+        noise_mix_type=args.noise_mix_type,
+        pooling_type=args.pooling_type,
+        pool_every_timestep=args.pool_every_timestep,
+        dropout=args.dropout,
+        bottleneck_dim=args.bottleneck_dim,
+        neighborhood_size=args.neighborhood_size,
+        grid_size=args.grid_size,
+        batch_norm=args.batch_norm,
+    )
+    generator.load_state_dict(checkpoint['g_state'])
+    generator.cuda()
+    generator.eval()
+    return generator
 
 
-def denorm(norm_traj):
-    """[N,2] norm → real 0.1° units"""
-    r = np.zeros_like(norm_traj)
-    r[:, 0] = norm_traj[:, 0] * 50.0 + 1800.0
-    r[:, 1] = norm_traj[:, 1] * 50.0
-    return r
+def getmin_helper(error,an,timeanpv, seq_start_end):
+    sum_ = 0
+    error = torch.stack(error, dim=1)
+    an = torch.stack(an, dim=1)
+    timeanpv = torch.stack(timeanpv, dim=1)
+    minpoint,minpoint_pv = [],[]
 
 
-def load_sat_image(him_path, year, name, timestamp):
-    p = os.path.join(him_path, str(year), name.upper(), f"{timestamp}.png")
-    if os.path.exists(p):
-        img = cv2.imread(p)
-        if img is not None:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    # fallback: nearest file
-    d = os.path.join(him_path, str(year), name.upper())
-    if os.path.exists(d):
-        pngs = sorted(f for f in os.listdir(d) if f.endswith('.png'))
-        if pngs:
-            tgt = datetime.strptime(timestamp, '%Y%m%d%H')
-            best = min(pngs, key=lambda f: abs(
-                (datetime.strptime(f[:-4], '%Y%m%d%H') - tgt).total_seconds()))
-            img = cv2.imread(os.path.join(d, best))
-            if img is not None:
-                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return np.zeros((800, 800, 3), dtype=np.uint8)
+    for (start, end) in seq_start_end:
+        start = start.item()
+        end = end.item()
+        _error = error[start:end]
+        _error = torch.sum(_error, dim=0)
+        _error = torch.argmin(_error)
+        # _error = torch.mean(_error)
+        minpoint.append(an[start:end,_error.data.cpu()])
+        minpoint_pv.append(timeanpv[start:end,_error.data.cpu()])
 
+    minpoint = torch.stack(minpoint,dim=1).squeeze()
+    minpoint_pv = torch.stack(minpoint_pv,dim=1).squeeze()
+    return {'tr':minpoint,'pv':minpoint_pv}
 
-def visualize_forecast(args):
-    set_seed(42)
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+def evaluate_helper(error, seq_start_end):
+    sum_ = 0
+    error = torch.stack(error, dim=1)
 
-    pred_len = detect_pred_len(args.model_path)
-    if args.pred_len != pred_len:
-        print(f"⚠️  pred_len overridden: {args.pred_len} → {pred_len}")
-        args.pred_len = pred_len
+    for (start, end) in seq_start_end:
+        start = start.item()
+        end = end.item()
+        _error = error[start:end]
+        _error = torch.sum(_error, dim=0)
+        _error = torch.min(_error)
+        # _error = torch.mean(_error)
 
-    # Load model
-    model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
-    ck    = torch.load(args.model_path, map_location=device, weights_only=False)
-    sd    = ck.get('model_state_dict', ck.get('model_state', ck))
-    model.load_state_dict(sd)
-    model.eval()
-    print("✅ Model loaded")
+        sum_ += _error
+    return sum_
 
-    # Load dataset
-    dset, _ = data_loader(
-        args, {'root': args.TC_data_path, 'type': args.dset_type},
-        test=True, test_year=args.test_year)
-    print(f"✅ {len(dset)} samples")
+def ve_evaluate_helper(error, seq_start_end):
+    sum_p = 0
+    sum_v = 0
+    error = torch.stack(error, dim=1)
 
-    t_name = args.tc_name.strip().upper()
-    t_date = str(args.tc_date).strip()
+    for (start, end) in seq_start_end:
+        start = start.item()
+        end = end.item()
+        _error = error[start:end]
+        _error = torch.sum(_error, dim=0)
+        _error = torch.min(_error,dim=0)
+        # _error = _error[0]
+        # _error = torch.mean(_error,dim=0)
+        sum_p += _error[0][0]
+        sum_v += _error[0][1]
+    return sum_p,sum_v
 
-    target = None
-    for i in range(len(dset)):
-        item = dset[i]
-        info = item[-1]
-        if (t_name in str(info['old'][1]).upper() and
-                t_date == str(info['tydate'][args.obs_len])):
-            target = item
-            print(f"✅ Found: {info['old'][1]} @ {t_date}")
-            break
-
-    if target is None:
-        print("❌ Not found! Check --tc_name and --tc_date")
-        return
-
-    # Build single-sample batch using seq_collate
-    from TCNM.data.trajectoriesWithMe_unet_training import seq_collate
-    batch = seq_collate([target])
-    batch = move_batch(batch, device)
-
+def evaluate(args, loader, generator, num_samples,sava_path):
+    ade_outer, fde_outer,tde_outer,ve_outer,ana_outer,pv_outer,gt = [], [],[],[],[],[],[]
+    total_traj = 0
     with torch.no_grad():
-        pred_traj_t, pred_Me_t = model.sample(batch)  # [T, B, 2]
+        for batch in loader:
 
-    # Squeeze batch dim (B=1)
-    obs_norm  = batch[0].squeeze(1).cpu().numpy()       # [obs_len, 2]
-    gt_norm   = batch[1].squeeze(1).cpu().numpy()       # [pred_len, 2]
-    pred_norm = pred_traj_t.squeeze(1).cpu().numpy()    # [pred_len, 2]
+            env_data = dic2cuda(batch[-2])
+            batch = [tensor.cuda() for tensor in batch[:-2]]
+            (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+             non_linear_ped, loss_mask, seq_start_end,obs_traj_Me, pred_traj_gt_Me, obs_traj_rel_Me, pred_traj_gt_rel_Me,
+             obs_date_mask, pred_date_mask,image_obs,image_pre) = batch
 
-    obs_r  = denorm(obs_norm)
-    gt_r   = denorm(gt_norm)
-    pred_r = denorm(pred_norm)
+            ade, fde,tde,ve = [], [],[],[]
+            analyse,analyse_pv = [],[]
+            total_traj += pred_traj_gt.size(1)
+            obs_traj = torch.cat([obs_traj, obs_traj_Me], dim=2)
+            gt.append(torch.cat([pred_traj_gt.permute(1, 0, 2), pred_traj_gt_Me.permute(1, 0, 2)], dim=2))
+            # pred_traj_gt = torch.cat([pred_traj_gt, pred_traj_gt_Me], dim=2)
+            obs_traj_rel = torch.cat([obs_traj_rel, obs_traj_rel_Me], dim=2)
+            pred_traj_gt_rel = torch.cat([pred_traj_gt_rel, pred_traj_gt_rel_Me], dim=2)
 
-    errors = np.linalg.norm(gt_r - pred_r, axis=1)
-    print("\\nErrors (km):")
-    for i, e in enumerate(errors):
-        print(f"  +{(i+1)*6:3d}h: {e*11.1:6.1f} km")
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    sat = load_sat_image(args.himawari_path, args.test_year, t_name, t_date)
-    SZ  = 900
-    sat = cv2.resize(sat, (SZ, SZ))
+            pred_traj_fake_rel,_,_,_ = generator(
+                obs_traj, obs_traj_rel, seq_start_end,image_obs,env_data,
+                num_samples=num_samples, all_g_out=False)
 
-    ref = obs_r[-1]
-    all_pts = np.vstack([obs_r, gt_r, pred_r])
-    span = np.max(all_pts, 0) - np.min(all_pts, 0)
-    scale = (SZ * 0.65) / (max(span) + 1e-6)
+            pred_traj_fake_relt = pred_traj_fake_rel
+            pred_traj_fake_rel = pred_traj_fake_relt[:,:,:,:2]
+            pred_traj_fake_rel_Me = pred_traj_fake_relt[:,:,:,2:]
 
-    def to_px(pts):
-        dx = (pts[:, 0] - ref[0]) * scale + SZ/2
-        dy = -(pts[:, 1] - ref[1]) * scale + SZ/2
-        return dx, dy
+            # pred_traj_fake_rel 用来预测后12个点与第8点的偏差
+            pred_traj_fake = relative_to_abs(
+                pred_traj_fake_rel, obs_traj[-1,:,:2]
+            )
+            pred_traj_fake_rel_Me = relative_to_abs(
+                pred_traj_fake_rel_Me, obs_traj_Me[-1]
+            )
+            # 只看坐标的偏差
 
-    fig, ax = plt.subplots(figsize=(14, 14))
-    ax.imshow(sat, extent=[0, SZ, SZ, 0], alpha=0.55)
+            # 函数会改变参数变量
+            real_pred_traj_gt,real_pred_traj_gt_Me = toNE(copy.deepcopy(pred_traj_gt),copy.deepcopy(pred_traj_gt_Me))
 
-    ox, oy = to_px(obs_r)
-    ax.plot(ox, oy, 'o-', color='#00FFFF', lw=3, ms=6,
-            markeredgecolor='white', markeredgewidth=1.5,
-            label=f'Observed ({args.obs_len*6}h)', zorder=8)
+                # ade.append(displacement_error(
+                #     pred_traj_fake, pred_traj_gt, mode='raw'
+                # ))
+            for sample_i in range(num_samples):
+                real_pred_traj_fake, real_pred_traj_fake_Me = toNE(pred_traj_fake[:,sample_i].squeeze(),
+                                                                   pred_traj_fake_rel_Me[:,sample_i].squeeze())
+                analyse.append(trajectory_diff(
+                    real_pred_traj_fake, real_pred_traj_gt, mode='raw'
+                ))
+                analyse_pv.append(value_diff(
+                    real_pred_traj_fake_Me, real_pred_traj_gt_Me, mode='raw'
+                ))
+                tde.append(trajectory_displacement_error(
+                    real_pred_traj_fake, real_pred_traj_gt, mode='raw'
+                ))
+                ve.append(value_error(
+                    real_pred_traj_fake_Me, real_pred_traj_gt_Me, mode='raw'
+                ))
 
-    full_gt = np.vstack([ref.reshape(1,-1), gt_r])
-    gx, gy  = to_px(full_gt)
-    ax.plot(gx, gy, 'o-', color='#FF0000', lw=4, ms=8,
-            markeredgecolor='white', markeredgewidth=2,
-            label=f'Actual ({args.pred_len*6}h)', zorder=9)
+                # fde.append(final_displacement_error(
+                #     pred_traj_fake[-1], pred_traj_gt[-1], mode='raw'
+                # ))
+            time_tde_sum = []
+            time_ve_sum = []
+            time_an_sum = []
+            time_anpv_sum = []
 
-    full_pred = np.vstack([ref.reshape(1,-1), pred_r])
-    px, py = to_px(full_pred)
-    ax.plot(px, py, 'o-', color='#00FF00', lw=4, ms=8,
-            markeredgecolor='darkgreen', markeredgewidth=2,
-            label=f'Forecast ({args.pred_len*6}h)', zorder=10)
+            for i in range(args.pred_len):
+                timeade = [x[:,i] for x in tde]
+                timean = [x[:, i] for x in analyse]
+                timeanpv = [x[:, i] for x in analyse_pv]
+                out = getmin_helper(timeade,timean,timeanpv, seq_start_end)
+                time_an_sum.append(out['tr'])
+                time_anpv_sum.append(out['pv'])
+            for i in range(args.pred_len):
+                timeade = [x[:,i] for x in tde]
+                time_tde_sum.append(evaluate_helper(timeade, seq_start_end))
 
-    for step in [3, 7, 11]:
-        if step < len(gx)-1 and step < len(errors):
-            ax.plot([gx[step+1], px[step+1]], [gy[step+1], py[step+1]],
-                    '--', color='yellow', lw=1.5, alpha=0.7, zorder=7)
+            for i in range(args.pred_len):
+                timeade = [x[:,i] for x in ve]
+                time_ve_sum.append(ve_evaluate_helper(timeade, seq_start_end))
+            # ade_sum = evaluate_helper(ade, seq_start_end)
+            # fde_sum = evaluate_helper(fde, seq_start_end)
 
-    for i in range(len(px)):
-        h = i * 6
-        if i == 0:
-            lbl, col = 'NOW', 'white'
-        elif i % 2 == 0:
-            ekm = errors[i-1]*11.1 if i > 0 else 0
-            lbl, col = f'+{h}h\n{ekm:.0f}km', 'lime'
-        else:
+            tde_outer.append(time_tde_sum)
+            ve_outer.append(time_ve_sum)
+            time_an_sum = torch.stack(time_an_sum,dim=1)
+            ana_outer.append(time_an_sum)
+            time_anpv_sum = torch.stack(time_anpv_sum, dim=1)
+            pv_outer.append(time_anpv_sum)
+            # fde_outer.append(fde_sum)
+        # ade_outer = torch.stack(ade_outer, dim=1)cvpr
+        if save_ana == True:
+            saveana(ana_outer,pv_outer,gt,sava_path)
+        tde_outer = torch.tensor(tde_outer)
+        ve_outer = torch.tensor(ve_outer)
+        ade = torch.sum(tde_outer,dim=0) / (total_traj)
+        ve = torch.sum(ve_outer,dim=0) / (total_traj)
+        fde = 0
+        return ade, ve
+
+import numpy as np
+def saveana(ana_outer,ve_outer,gt,sava_path):
+    ana_outer = torch.cat(ana_outer, dim=0)
+    ana_outer_np = ana_outer.data.cpu().numpy()
+    ve_outer = torch.cat(ve_outer, dim=0)
+    ve_outer_np = ve_outer.data.cpu().numpy()
+    gt = torch.cat(gt, dim=0)
+    gt_np = gt.data.cpu().numpy()
+    traj_path = os.path.join(sava_path,'trajectory.npy')
+    pv_path = os.path.join(sava_path, 'pvdif.npy')
+    gt_path = os.path.join(sava_path, 'gt.npy')
+    if os.path.exists(traj_path):
+        tra = np.load(traj_path)
+        np.save(traj_path,(ana_outer_np+tra)/2)
+    else:
+        np.save(traj_path, ana_outer_np)
+    if os.path.exists(pv_path):
+        pv = np.load(pv_path)
+        np.save(pv_path, (ve_outer_np+pv)/2)
+    else:
+        np.save(pv_path, ve_outer_np)
+    np.save(gt_path, gt_np)
+# def saveana(ana_outer,ve_outer,gt):
+#     ana_outer = torch.cat(ana_outer, dim=0)
+#     ana_outer_np = ana_outer.data.cpu().numpy()
+#     ve_outer = torch.cat(ve_outer, dim=0)
+#     ve_outer_np = ve_outer.data.cpu().numpy()
+#     gt = torch.cat(gt, dim=0)
+#     gt_np = gt.data.cpu().numpy()
+#     if os.path.exists('trajectory.npy'):
+#         tra = np.load('trajectory.npy')
+#         np.save('trajectory.npy',(ana_outer_np+tra)/2)
+#     else:
+#         np.save('trajectory.npy', ana_outer_np)
+#     if os.path.exists('pvdif.npy'):
+#         pv = np.load('pvdif.npy')
+#         np.save('pvdif.npy', (ve_outer_np+pv)/2)
+#     else:
+#         np.save('pvdif.npy', ve_outer_np)
+#     np.save('gt.npy', gt_np)
+#
+#     pass
+
+def print_log(modelpath,tde,ve,_args,f_path,mode):
+    f = open(f_path,mode)
+    print(os.path.split(modelpath)[1])
+    print('Dataset: {}, Pred Len: {}'.format(
+        _args.dataset_root, _args.pred_len))
+    print('TDR:', tde)
+    print('TDR:', ve)
+    print(os.path.split(modelpath)[1],file=f)
+    print('Dataset: {}, Pred Len: {}'.format(
+        _args.dataset_root, _args.pred_len),file=f)
+    print('TDR:', tde,file=f)
+    print('TDR:', ve,file=f)
+    f.close()
+
+def main(args):
+    sava_path = args.model_path
+    areas_str = ''
+
+    for a in areas:
+        areas_str = areas_str+a
+
+    log_file = os.path.join(sava_path,'result_log_'+areas_str+'_'+args.dset_type+'_'+pt_num+'.txt')
+    best_file = os.path.join(sava_path,'result_best_'+areas_str+'_'+args.dset_type+'_'+pt_num+'.txt')
+    min_error = 10000000
+    if os.path.isdir(args.model_path):
+        filenames = os.listdir(args.model_path)
+        filenames.sort()
+        paths = [
+            os.path.join(args.model_path, file_) for file_ in filenames
+        ]
+    else:
+        paths = [args.model_path]
+
+    for path in paths:
+
+
+        if 'no_' in path or 'pt' not in path or pt_num not in path:
             continue
-        ax.text(px[i], py[i]-25, lbl, fontsize=9, color=col, ha='center',
-                fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.4', fc='black', alpha=0.8, ec=col, lw=2),
-                zorder=15)
+        modelpath = path
+        checkpoint = torch.load(path)
+        # print(checkpoint['args'])
+        generator = get_generator(checkpoint)
+        _args = AttrDict(checkpoint['args'])
+        path = get_dset_path(_args.dataset_root, args.dset_type)
+        _args.areas = args.areas
+        _, loader = data_loader(_args, {'root':args.TC_data_path,'type':'test'},test_year=test_year)
+        tde, ve = evaluate(_args, loader, generator, args.num_samples,sava_path)
+        print_log(modelpath,tde,ve,_args,log_file,'a')
+        if torch.mean(tde).item() < min_error:
+            min_error =torch.mean(tde).item()
+            print('now_best==================:')
+            print_log(modelpath, tde, ve, _args, best_file,'w')
 
-    ax.scatter([SZ/2], [SZ/2], color='yellow', marker='*', s=700,
-               edgecolors='red', linewidths=3, zorder=25, label='Current')
 
-    title = (f"🌀 {t_name}  {args.pred_len*6}h FORECAST\\n"
-             f"Mean: {np.mean(errors)*11.1:.0f} km  |  {args.pred_len*6}h: {errors[-1]*11.1:.0f} km")
-    plt.title(title, fontsize=16, fontweight='bold', color='white', pad=15,
-              bbox=dict(boxstyle='round,pad=0.8', fc='black', alpha=0.9, ec='cyan', lw=2))
-    plt.legend(loc='upper right', fontsize=11, framealpha=0.9,
-               facecolor='black', edgecolor='cyan', labelcolor='white')
-    plt.xlim(0, SZ); plt.ylim(SZ, 0); plt.axis('off')
-    plt.tight_layout()
+    return tde,ve
 
-    out = f"forecast_{args.pred_len*6}h_{t_name}_{t_date}.png"
-    plt.savefig(out, dpi=180, bbox_inches='tight', facecolor='black')
-    plt.close()
-    print(f"\n✅ Saved: {out}")
 
+def seed_torch():
+    seed = 1024 # 用户设定
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser()
-    p.add_argument('--model_path',    required=True)
-    p.add_argument('--TC_data_path',  required=True)
-    p.add_argument('--himawari_path', required=True)
-    p.add_argument('--tc_name',       default='WIPHA')
-    p.add_argument('--tc_date',       default='2019073106')
-    p.add_argument('--test_year',     type=int, default=2019)
-    p.add_argument('--obs_len',       type=int, default=8)
-    p.add_argument('--pred_len',      type=int, default=12)
-    p.add_argument('--dset_type',     default='test')
-    p.add_argument('--batch_size',    type=int, default=1)
-    p.add_argument('--delim',         default=' ')
-    p.add_argument('--skip',          type=int, default=1)
-    p.add_argument('--min_ped',       type=int, default=1)
-    p.add_argument('--threshold',     type=float, default=0.002)
-    p.add_argument('--other_modal',   default='gph')
-    visualize_forecast(p.parse_args())
+    seed_torch()
+    args = parser.parse_args()
+    num = 1
+    for i in range(num):
+        ted,ve = main(args)
+        if i == 0:
+            ated, ave = ted,ve
+        else:
+            ated += ted
+            ave+=ve
+    print(ated/num,ave/num)
+
+# tensor([ 26.5824,  55.9043,  90.2042, 131.4698, 176.3860, 223.9666, 275.9354,
+#         330.8814]) tensor([[2.0437, 1.0676],
+#         [3.4686, 1.7413],
+#         [4.6360, 2.3311],
+#         [5.6804, 2.9030],
+#         [6.5302, 3.3760],
+#         [7.2055, 3.7640],
+#         [7.6929, 4.0698],
+#         [8.0324, 4.2986]])
+
+# TDR: tensor([24.1299, 47.1854, 70.9537, 99.6390])
+# TDR: tensor([[1.4675, 0.8048],
+#         [2.3847, 1.2670],
+#         [3.1876, 1.7535],
+#         [3.8575, 2.2104]])
+
+# checkpoint_with_model_5100.pt
+# Dataset: 1950_2019, Pred Len: 4
+# TDR: tensor([ 23.9360,  47.1055,  72.3829, 103.1691])
+# TDR: tensor([[1.4391, 0.7826],
+#         [2.3931, 1.3135],
+#         [3.1570, 1.7947],
+#         [3.8620, 2.2161]])
