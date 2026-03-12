@@ -1147,27 +1147,35 @@ class TCFlowMatching(nn.Module):
         Simplified BVE  ∂ζ/∂t + β v ≈ 0  in normalised coordinates.
         Provides non-zero, well-scaled gradient without ERA5 data.
         """
+
         T = pred_abs.shape[0]
         if T < 4:
-            return pred_abs.new_zeros(())
+            return pred_abs.new_zeros(1).squeeze()
 
-        v    = pred_abs[1:] - pred_abs[:-1]          # [T-1, B, 2]
-        vx   = v[..., 0]
-        vy   = v[..., 1]
+        v  = pred_abs[1:] - pred_abs[:-1]   # [T-1, B, 2]
+        vx = v[..., 0]                       # [T-1, B]
+        vy = v[..., 1]                       # [T-1, B]
 
-        # proxy vorticity: 2-D cross product of consecutive step vectors
-        zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]  # [T-2, B]
+        # ζ[t] = vx[t+1]*vy[t] - vy[t+1]*vx[t]  →  [T-2, B]
+        zeta = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
+
         if zeta.shape[0] < 2:
-            return pred_abs.new_zeros(())
+            return pred_abs.new_zeros(1).squeeze()
 
-        dzeta = zeta[1:] - zeta[:-1]                  # [T-3, B]
+        # Δζ[t] = ζ[t+1] - ζ[t]  →  [T-3, B]
+        dzeta = zeta[1:] - zeta[:-1]
 
-        # β in normalised coords ≈ 0.276 × cos(lat)
-        beta_factor = 2.0 * OMEGA * (NORM_TO_DEG * 111000.0) * DT_6H / R_EARTH
-        lat_rad = pred_abs[2:-1, :, 1] * NORM_TO_DEG * (math.pi / 180.0)
-        beta_n  = beta_factor * torch.cos(lat_rad)    # [T-2, B]
+        # β at positions 2..T-2  →  [T-3, B]
+        # pred_abs[2 : T-1] has shape [T-3, B, 2]
+        lat_norm = pred_abs[2:T-1, :, 1]                          # [T-3, B]
+        lat_rad  = lat_norm * NORM_TO_DEG * (math.pi / 180.0)
+        beta_n   = BETA_NORM_FACTOR * torch.cos(lat_rad)          # [T-3, B]
 
-        residual = dzeta + beta_n[:-1] * vy[1:-1]     # [T-3, B]
+        # v_y at same positions  →  [T-3, B]
+        # v[t] = pred_abs[t+1] - pred_abs[t], so v[1:T-2] aligns with steps 2..T-2
+        v_y = vy[1:T-2]                                           # [T-3, B]
+
+        residual = dzeta + beta_n * v_y                           # [T-3, B]
         return (residual ** 2).mean()
 
     # ── Training loss — Eq. (60) ───────────────────────────────────────────────
