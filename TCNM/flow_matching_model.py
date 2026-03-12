@@ -691,6 +691,8 @@ NORM_TO_DEG = 5.0
 ERA5_RES_DEG  = 0.25   # degrees per pixel
 DELTA_DEG     = 0.10   # perturbation for finite-difference vorticity (≈11 km)
 
+NORM_TO_M        = NORM_TO_DEG * 111000.0
+BETA_NORM_FACTOR = 2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH   # ~0.276
 
 # ── ERA5 helpers ───────────────────────────────────────────────────────────────
 
