@@ -1160,43 +1160,50 @@
 """
 scripts/train_flowmatching.py
 ==============================
-Training TCFlowMatching v6 FIXED với OT-CFM + PINN Vorticity (BVE).
+Training script for TCFlowMatching v7.
 
-Loss weights (v6 FIXED):
-    1.0 * fm_loss  +  1.5 * overall_dir  +  2.5 * step_dir
-  + 1.0 * disp     +  3.0 * heading      +  0.2 * smooth
-  + 0.5 * pinn
+Loss weights per Eq. (60):
+    FM=1.0  overall_dir=2.0  step_dir=0.5  disp=1.0
+    heading=2.0  smooth=0.2  pinn=0.5
 
-Data split:
-  - train/  : training data
-  - val/    : validation (early stopping, best model selection)
-  - test/   : held-out test set (chỉ đánh giá cuối cùng)
-
-Chạy:
-  python scripts/train_flowmatching.py \\
-      --dataset_root TCND_vn \\
-      --output_dir   model_save/flowmatching_v6 \\
-      --ode_steps 10 --sigma_min 0.02 \\
-      --num_epochs 200 --batch_size 32
+Run:
+    python scripts/train_flowmatching.py \\
+        --dataset_root TCND_vn \\
+        --output_dir   model_save/flowmatching_v7 \\
+        --sigma_min 0.02 --ode_steps 10 \\
+        --num_epochs 200 --batch_size 32
 """
 
-import argparse, os, sys, time
-import torch, torch.optim as optim
-import torch.nn.functional as F
-import numpy as np
+from __future__ import annotations
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import numpy as np
+import torch
+import torch.optim as optim
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from TCNM.data.loader import data_loader
 from TCNM.flow_matching_model import TCFlowMatching
 from TCNM.utils import get_cosine_schedule_with_warmup
 
 
-def get_args():
-    p = argparse.ArgumentParser()
+# ── CLI arguments ──────────────────────────────────────────────────────────────
+
+def get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    # Data
     p.add_argument('--dataset_root',    default='TCND_vn',                   type=str)
     p.add_argument('--obs_len',         default=8,                            type=int)
     p.add_argument('--pred_len',        default=12,                           type=int)
+    p.add_argument('--test_year',       default=2019,                         type=int)
+
+    # Training
     p.add_argument('--batch_size',      default=32,                           type=int)
     p.add_argument('--num_epochs',      default=200,                          type=int)
     p.add_argument('--g_learning_rate', default=2e-4,                         type=float)
@@ -1204,421 +1211,394 @@ def get_args():
     p.add_argument('--warmup_epochs',   default=5,                            type=int)
     p.add_argument('--grad_clip',       default=1.0,                          type=float)
     p.add_argument('--patience',        default=40,                           type=int)
-    p.add_argument('--gpu_num',         default='0',                          type=str)
-    p.add_argument('--output_dir',      default='model_save/flowmatching_v6', type=str)
-    p.add_argument('--save_interval',   default=10,                           type=int)
-    p.add_argument('--test_year',       default=2019,                         type=int)
-    p.add_argument('--val_ensemble',    default=5,                            type=int)
+
+    # Model
+    p.add_argument('--sigma_min',       default=0.02,                         type=float)
     p.add_argument('--ode_steps',       default=10,                           type=int)
+    p.add_argument('--val_ensemble',    default=5,                            type=int)
+
+    # Logging
+    p.add_argument('--output_dir',      default='model_save/flowmatching_v7', type=str)
+    p.add_argument('--save_interval',   default=10,                           type=int)
     p.add_argument('--val_freq',        default=5,                            type=int)
-    p.add_argument('--sigma_min',       default=0.02,                         type=float)  # FIX 1
-    # Dataset compat
+    p.add_argument('--gpu_num',         default='0',                          type=str)
+
+    # Dataset loader compat flags
     p.add_argument('--d_model',     default=128,   type=int)
     p.add_argument('--delim',       default=' ')
     p.add_argument('--skip',        default=1,     type=int)
     p.add_argument('--min_ped',     default=1,     type=int)
     p.add_argument('--threshold',   default=0.002, type=float)
     p.add_argument('--other_modal', default='gph')
+
     return p.parse_args()
 
 
-def resolve_data_path(root):
-    """Trả về (train_dir, val_dir, test_dir)."""
+# ── Data helpers ───────────────────────────────────────────────────────────────
+
+def resolve_data_dirs(root: str):
     root = root.rstrip('/\\')
     if root.endswith(('Data1d/train', 'Data1d\\train')):
         base = root[:-len('train')]
-    elif root.endswith(('Data1d/test', 'Data1d\\test')):
-        base = root[:-len('test')]
     elif root.endswith('Data1d'):
         base = root + os.sep
     else:
         base = os.path.join(root, 'Data1d') + os.sep
+    return (
+        os.path.join(base, 'train'),
+        os.path.join(base, 'val'),
+        os.path.join(base, 'test'),
+    )
 
-    return (os.path.join(base, 'train'),
-            os.path.join(base, 'val'),
-            os.path.join(base, 'test'))
 
-
-def move_batch(bl, device):
-    for j, x in enumerate(bl):
+def move_to(batch, device: torch.device):
+    out = list(batch)
+    for i, x in enumerate(out):
         if torch.is_tensor(x):
-            bl[j] = x.to(device)
+            out[i] = x.to(device)
         elif isinstance(x, dict):
-            bl[j] = {k: v.to(device) if torch.is_tensor(v) else v
-                     for k, v in x.items()}
-    return bl
+            out[i] = {k: v.to(device) if torch.is_tensor(v) else v
+                      for k, v in x.items()}
+    return out
 
 
-def denorm_traj(n):
-    r = n.clone()
-    r[..., 0] = n[..., 0] * 50 + 1800
-    r[..., 1] = n[..., 1] * 50
-    return r
+def denorm_to_deg(t: torch.Tensor) -> torch.Tensor:
+    """Normalised → degrees:  lon_norm*5+180, lat_norm*5."""
+    out = t.clone()
+    out[..., 0] = t[..., 0] * 5.0 + 180.0
+    out[..., 1] = t[..., 1] * 5.0
+    return out
 
 
-# ── Loss breakdown (v6 FIXED weights) ────────────────────────────────────────
-def compute_loss_breakdown(model, batch_list):
-    traj_gt = batch_list[1]
-    Me_gt   = batch_list[8]
-    obs     = batch_list[0]
-    obs_Me  = batch_list[7]
+# ── Evaluation ─────────────────────────────────────────────────────────────────
 
-    B      = traj_gt.shape[1]
-    device = traj_gt.device
-    lp, lm = obs[-1], obs_Me[-1]
-    sm     = model.sigma_min
-
-    x1    = model.traj_to_rel(traj_gt, Me_gt, lp, lm)
-    x0    = torch.randn_like(x1) * sm          # FIX 1: sm=0.02
-    t     = torch.rand(B, device=device)
-    t_exp = t.view(B, 1, 1)
-
-    x_t        = t_exp * x1 + (1 - t_exp * (1 - sm)) * x0
-    denom      = (1 - (1 - sm) * t_exp).clamp(min=1e-5)
-    target_vel = (x1 - (1 - sm) * x_t) / denom
-
-    pred_vel    = model.net(x_t, t, batch_list)
-    fm_loss     = F.mse_loss(pred_vel, target_vel)
-
-    pred_x1     = x_t + denom * pred_vel
-    pred_abs, _ = model.rel_to_abs(pred_x1, lp, lm)
-
-    overall_dir = model._overall_dir_loss(pred_abs, traj_gt, lp)
-    step_dir    = model._step_dir_loss(pred_abs, traj_gt)      # FIX 4
-    disp_l      = model._weighted_disp_loss(pred_abs, traj_gt)
-    heading_l   = model._heading_change_loss(pred_abs, traj_gt) # FIX 3
-    smt_l       = model._smooth_loss(pred_abs)
-    pinn_l      = model._ns_pinn_loss(pred_abs)                  # FIX 2
-
-    # FIX 5: weights heading 2.0→3.0, step_dir 1.5→2.5
-    total = (  1.0 * fm_loss
-             + 1.5 * overall_dir
-             + 2.5 * step_dir
-             + 1.0 * disp_l
-             + 3.0 * heading_l
-             + 0.2 * smt_l
-             + 0.5 * pinn_l)
-
-    return {
-        'total':       total,
-        'fm':          fm_loss.item(),
-        'overall_dir': overall_dir.item(),
-        'step_dir':    step_dir.item(),
-        'disp':        disp_l.item(),
-        'heading':     heading_l.item(),
-        'smooth':      smt_l.item(),
-        'pinn':        pinn_l.item(),
-    }
-
-
-# ── Evaluation ────────────────────────────────────────────────────────────────
-def evaluate_km(model, loader, device, num_ensemble=5, ddim_steps=10, pred_len=12):
+def evaluate(
+    model:        TCFlowMatching,
+    loader,
+    device:       torch.device,
+    num_ensemble: int,
+    ddim_steps:   int,
+    pred_len:     int,
+) -> dict:
+    """
+    Returns ADE, FDE, per-lead-time errors, and inference speed.
+    Distance: normalised units × 11.1 km (0.1° ≈ 11.1 km at equator).
+    """
     model.eval()
-    all_step_errors = []
-    total_sample_ms = 0.0
-    n_batches       = 0
+    step_errors = []
+    total_ms    = 0.0
+    n_batches   = 0
 
     with torch.no_grad():
         for batch in loader:
-            bl = move_batch(list(batch), device)
-            gt = bl[1]
+            bl = move_to(list(batch), device)
+            gt = bl[1]                            # [T_pred, B, 2]
 
-            t0 = time.time()
+            t0 = time.perf_counter()
             pred, _ = model.sample(bl, num_ensemble=num_ensemble,
                                    ddim_steps=ddim_steps)
-            total_sample_ms += (time.time() - t0) * 1000
+            total_ms += (time.perf_counter() - t0) * 1e3
             n_batches += 1
 
-            pred_r = denorm_traj(pred)
-            gt_r   = denorm_traj(gt)
-            dist   = torch.norm(pred_r - gt_r, dim=2) * 11.1
-            all_step_errors.append(dist.mean(dim=1).cpu())
+            pred_deg = denorm_to_deg(pred)
+            gt_deg   = denorm_to_deg(gt)
+            dist_km  = pred_deg.sub(gt_deg).norm(dim=-1).mul(11.1)  # [T, B]
+            step_errors.append(dist_km.mean(dim=1).cpu())            # [T]
 
-    stacked    = torch.stack(all_step_errors, dim=0)
-    mean_steps = stacked.mean(dim=0)
+    mean_steps = torch.stack(step_errors).mean(dim=0)  # [T_pred]
 
-    m = {'ADE': mean_steps.mean().item(), 'FDE': mean_steps[-1].item()}
-    for h, s in [(12, 1), (24, 3), (48, 7), (72, 11)]:
+    m = {
+        'ADE': mean_steps.mean().item(),
+        'FDE': mean_steps[-1].item(),
+        'ms_per_batch': total_ms / max(n_batches, 1),
+    }
+    for h, s in ((12, 1), (24, 3), (48, 7), (72, 11)):
         if s < pred_len:
             m[f'{h}h'] = mean_steps[s].item()
-    m['sample_ms_per_batch'] = total_sample_ms / max(n_batches, 1)
-    return m, mean_steps
+
+    return m
 
 
-# ── Best Model Saver ──────────────────────────────────────────────────────────
+# ── Checkpoint helper ──────────────────────────────────────────────────────────
+
 class BestModelSaver:
-    def __init__(self, patience=40, min_delta=2.0, verbose=True):
+    def __init__(self, patience: int = 40, min_delta: float = 2.0):
         self.patience   = patience
         self.min_delta  = min_delta
-        self.verbose    = verbose
-        self.counter    = 0
         self.best_ade   = float('inf')
+        self.counter    = 0
         self.early_stop = False
 
-    def __call__(self, ade_km, model, out_dir, epoch, opt, train_loss, val_loss):
-        if ade_km < self.best_ade - self.min_delta:
-            self.best_ade = ade_km
+    def __call__(
+        self,
+        ade:        float,
+        model:      TCFlowMatching,
+        out_dir:    str,
+        epoch:      int,
+        optimizer:  torch.optim.Optimizer,
+        train_loss: float,
+        val_loss:   float,
+    ):
+        if ade < self.best_ade - self.min_delta:
+            self.best_ade = ade
             self.counter  = 0
-            ckpt = os.path.join(out_dir, 'best_model.pth')
+            path = os.path.join(out_dir, 'best_model.pth')
             torch.save({
                 'epoch':            epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state':  opt.state_dict(),
+                'optimizer_state':  optimizer.state_dict(),
                 'train_loss':       train_loss,
                 'val_loss':         val_loss,
-                'val_ade_km':       ade_km,
-                'model_type':       'TCFlowMatching_v6_FIXED',
-                'args': {
-                    'obs_len':   model.obs_len,
-                    'pred_len':  model.pred_len,
-                    'sigma_min': model.sigma_min,
-                },
-            }, ckpt)
-            if self.verbose:
-                print(f"  ✅ Best val ADE: {ade_km:.1f} km  →  {ckpt}")
+                'val_ade_km':       ade,
+                'model_version':    'v7',
+                'loss_eq':          'Eq60: FM=1.0 dir=2.0 step=0.5 disp=1.0 heading=2.0 smooth=0.2 pinn=0.5',
+                'sigma_min':        model.sigma_min,
+                'pred_len':         model.pred_len,
+                'obs_len':          model.obs_len,
+            }, path)
+            print(f"  ✅  Best ADE {ade:.1f} km  →  {path}")
         else:
             self.counter += 1
-            if self.verbose:
-                print(f"  EarlyStopping: {self.counter}/{self.patience}"
-                      f"  (best={self.best_ade:.1f} km)")
+            print(f"  ⏳  No improvement {self.counter}/{self.patience}"
+                  f"  (best={self.best_ade:.1f} km)")
             if self.counter >= self.patience:
                 self.early_stop = True
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main(args):
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main(args: argparse.Namespace):
     if torch.cuda.is_available():
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 70)
-    print("  TC-FlowMatching v6 FIXED  |  OT-CFM + PINN (BVE)")
-    print("=" * 70)
-    print(f"  Device      : {device}")
-    print(f"  sigma_min   : {args.sigma_min}  (FIX 1: 0.001→0.02)")
-    print(f"  ODE steps   : {args.ode_steps}")
-    print(f"  Ensemble    : {args.val_ensemble}")
-    print(f"  LR          : {args.g_learning_rate}  WD: {args.weight_decay}")
-    print(f"  Epochs      : {args.num_epochs}  Patience: {args.patience}")
-    print(f"  Loss weights: FM=1.0  overall_dir=1.5  step_dir=2.5")
-    print(f"                disp=1.0  heading=3.0  smooth=0.2  pinn=0.5")
-    print("=" * 70)
+    if args.sigma_min < 0.01:
+        print(f"  ⚠️  sigma_min={args.sigma_min} — recommend ≥ 0.02")
 
-    train_dir, val_dir, test_dir = resolve_data_path(args.dataset_root)
-    print(f"\n  Data: train={train_dir}\n"
-          f"        val={val_dir}\n"
-          f"        test={test_dir}  (held-out year={args.test_year})")
+    print("=" * 68)
+    print("  TC-FlowMatching v7  |  Loss: Eq. (60)")
+    print("=" * 68)
+    print(f"  device      {device}")
+    print(f"  sigma_min   {args.sigma_min}")
+    print(f"  ode_steps   {args.ode_steps}   ensemble {args.val_ensemble}")
+    print(f"  epochs      {args.num_epochs}   patience {args.patience}")
+    print(f"  LR          {args.g_learning_rate}   WD {args.weight_decay}")
+    print(f"  Eq.(60)     FM=1.0  dir=2.0  step=0.5  disp=1.0")
+    print(f"              heading=2.0  smooth=0.2  pinn=0.5")
+    print("=" * 68)
+
+    # ── Data loaders ───────────────────────────────────────────────────────────
+    train_dir, val_dir, test_dir = resolve_data_dirs(args.dataset_root)
 
     _, train_loader = data_loader(args, {'root': train_dir, 'type': 'train'}, test=False)
 
     val_loader = None
-    if os.path.exists(val_dir):
+    if os.path.isdir(val_dir):
         _, val_loader = data_loader(args, {'root': val_dir, 'type': 'val'}, test=True)
-        print(f"\n  Val loader: {len(val_loader.dataset)} seq")
-    elif os.path.exists(test_dir):
-        print(f"\n  ⚠️  val/ không tồn tại → fallback test/")
+        print(f"\n  train  {len(train_loader.dataset):>5} seq")
+        print(f"  val    {len(val_loader.dataset):>5} seq")
+    else:
+        print(f"\n  ⚠️  val/ not found — using test/ as validation")
         _, val_loader = data_loader(args, {'root': test_dir, 'type': 'test'},
                                     test=True, test_year=args.test_year)
-        print(f"  Val (fallback): {len(val_loader.dataset)} seq")
+        print(f"  train  {len(train_loader.dataset):>5} seq")
+        print(f"  val    {len(val_loader.dataset):>5} seq  (test/ folder)")
 
     test_loader = None
-    if os.path.exists(test_dir):
+    if os.path.isdir(test_dir):
         _, test_loader = data_loader(args, {'root': test_dir, 'type': 'test'},
                                      test=True, test_year=args.test_year)
-        print(f"  Test loader: {len(test_loader.dataset)} seq")
+        print(f"  test   {len(test_loader.dataset):>5} seq  (year={args.test_year})\n")
 
-    print(f"\n  Train: {len(train_loader.dataset)} seq  "
-          f"Val: {len(val_loader.dataset) if val_loader else 0} seq  "
-          f"Test: {len(test_loader.dataset) if test_loader else 0} seq\n")
-
-    # Model
+    # ── Model ──────────────────────────────────────────────────────────────────
     model = TCFlowMatching(
         pred_len  = args.pred_len,
         obs_len   = args.obs_len,
         sigma_min = args.sigma_min,
     ).to(device)
 
-    n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters  : {n_p:,}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  parameters  {n_params:,}\n")
 
-    assert hasattr(model, "_ns_pinn_loss"),        "❌ Model thiếu _ns_pinn_loss"
-    assert hasattr(model, "_heading_change_loss"), "❌ Model thiếu _heading_change_loss"
-    assert hasattr(model, "_step_dir_loss"),       "❌ Model thiếu _step_dir_loss"
-    print("  ✅ v6 FIXED losses confirmed (6 fixes)\n")
+    # ── Optimiser + scheduler ──────────────────────────────────────────────────
+    optimizer     = optim.AdamW(model.parameters(),
+                                lr=args.g_learning_rate,
+                                weight_decay=args.weight_decay)
+    total_steps   = len(train_loader) * args.num_epochs
+    warmup_steps  = len(train_loader) * args.warmup_epochs
+    scheduler     = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    saver         = BestModelSaver(patience=args.patience)
 
-    optimizer    = optim.AdamW(model.parameters(),
-                               lr=args.g_learning_rate,
-                               weight_decay=args.weight_decay)
-    total_steps  = len(train_loader) * args.num_epochs
-    warmup_steps = len(train_loader) * args.warmup_epochs
-    scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    saver        = BestModelSaver(patience=args.patience, verbose=True)
-
+    # ── Logging ────────────────────────────────────────────────────────────────
     log_path = os.path.join(args.output_dir, 'training_log.csv')
     with open(log_path, 'w') as f:
-        f.write("epoch,train_loss,val_loss,val_ADE_km,val_FDE_km,"
-                "val_12h,val_24h,val_48h,val_72h,sigma_min,"
-                "epoch_time_s,sample_ms_per_batch,"
-                "fm,overall_dir,step_dir,disp,heading,smooth,pinn\n")
+        f.write("epoch,train_loss,val_loss,ADE_km,FDE_km,"
+                "12h_km,24h_km,48h_km,72h_km,"
+                "fm,dir,step,disp,heading,smooth,pinn,"
+                "epoch_s,ms_per_batch\n")
 
-    print("=" * 70 + "\n  TRAINING\n" + "=" * 70)
-    epoch_times = []
+    # ── Training loop ──────────────────────────────────────────────────────────
+    print("=" * 68)
+    print("  TRAINING")
+    print("=" * 68)
+
+    epoch_times: list[float] = []
 
     for epoch in range(args.num_epochs):
         model.train()
-        train_loss = 0.0
-        loss_accum = {k: 0 for k in ['fm','overall_dir','step_dir',
-                                      'disp','heading','smooth','pinn']}
-        t0 = time.time()
+
+        sum_total = 0.0
+        sum_parts = {k: 0.0 for k in ('fm','dir','step','disp','heading','smooth','pinn')}
+        t0 = time.perf_counter()
 
         for i, batch in enumerate(train_loader):
-            bl   = move_batch(list(batch), device)
-            bd   = compute_loss_breakdown(model, bl)
-            loss = bd['total']
+            bl = move_to(list(batch), device)
+            bd = model.get_loss_breakdown(bl)
 
             optimizer.zero_grad()
-            loss.backward()
+            bd['total'].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             scheduler.step()
 
-            train_loss += loss.item()
-            for k in loss_accum:
-                loss_accum[k] += bd[k]
+            sum_total += bd['total'].item()
+            for k in sum_parts:
+                sum_parts[k] += bd[k]
 
             if i % 20 == 0:
                 lr = optimizer.param_groups[0]['lr']
                 print(f"  [{epoch:>3}/{args.num_epochs}][{i:>3}/{len(train_loader)}]"
-                      f"  total={loss.item():.4f}"
+                      f"  total={bd['total'].item():.4f}"
                       f"  fm={bd['fm']:.3f}"
                       f"  heading={bd['heading']:.3f}"
                       f"  pinn={bd['pinn']:.4f}"
                       f"  lr={lr:.2e}")
 
-        ep_time  = time.time() - t0
-        epoch_times.append(ep_time)
-        avg_train = train_loss / len(train_loader)
-        n_bat     = len(train_loader)
-        avg_bd    = {k: v / n_bat for k, v in loss_accum.items()}
+        ep_s      = time.perf_counter() - t0
+        epoch_times.append(ep_s)
+        n         = len(train_loader)
+        avg_train = sum_total / n
+        avg_parts = {k: v / n for k, v in sum_parts.items()}
 
-        if val_loader:
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for batch in val_loader:
-                    bl = move_batch(list(batch), device)
-                    val_loss += model.get_loss(bl).item()
-            avg_val = val_loss / len(val_loader)
+        # Validation loss (every epoch)
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                bl = move_to(list(batch), device)
+                val_loss += model.get_loss(bl).item()
+        avg_val = val_loss / len(val_loader)
 
-            if epoch % args.val_freq == 0 or epoch < 5:
-                m, _ = evaluate_km(model, val_loader, device,
-                                   num_ensemble=args.val_ensemble,
-                                   ddim_steps=args.ode_steps,
-                                   pred_len=args.pred_len)
-                ade, fde, sms = m['ADE'], m['FDE'], m['sample_ms_per_batch']
+        # Full evaluation (every val_freq epochs)
+        if epoch % args.val_freq == 0 or epoch < 3:
+            m = evaluate(model, val_loader, device,
+                         num_ensemble=args.val_ensemble,
+                         ddim_steps=args.ode_steps,
+                         pred_len=args.pred_len)
 
-                print(f"\n{'─'*70}")
-                print(f"  Epoch {epoch:>3} │ train={avg_train:.4f}  val={avg_val:.4f}"
-                      f"  time={ep_time:.1f}s")
-                print(f"  Loss   │ fm={avg_bd['fm']:.3f}"
-                      f"  dir={avg_bd['overall_dir']:.3f}+{avg_bd['step_dir']:.3f}"
-                      f"  heading={avg_bd['heading']:.3f}"
-                      f"  pinn={avg_bd['pinn']:.4f}")
-                print(f"  Val km │ ADE={ade:.1f}  FDE={fde:.1f}"
-                      f"  24h={m.get('24h',0):.0f}"
-                      f"  48h={m.get('48h',0):.0f}"
-                      f"  72h={m.get('72h',0):.0f}")
-                print(f"  Speed  │ sample={sms:.1f}ms/batch"
-                      f"  avg_epoch={sum(epoch_times)/len(epoch_times):.1f}s")
-                print(f"{'─'*70}\n")
+            avg_ep = sum(epoch_times) / len(epoch_times)
+            print(f"\n{'─'*68}")
+            print(f"  Epoch {epoch:>3}  train={avg_train:.4f}  val={avg_val:.4f}"
+                  f"  ({ep_s:.0f}s, avg {avg_ep:.0f}s)")
+            print(f"  fm={avg_parts['fm']:.4f}  dir={avg_parts['dir']:.4f}"
+                  f"  step={avg_parts['step']:.4f}  disp={avg_parts['disp']:.4f}")
+            print(f"  heading={avg_parts['heading']:.4f}"
+                  f"  smooth={avg_parts['smooth']:.4f}"
+                  f"  pinn={avg_parts['pinn']:.4f}")
+            print(f"  ADE={m['ADE']:.1f} km  FDE={m['FDE']:.1f} km"
+                  f"  24h={m.get('24h',0):.0f}"
+                  f"  48h={m.get('48h',0):.0f}"
+                  f"  72h={m.get('72h',0):.0f} km"
+                  f"  ({m['ms_per_batch']:.0f}ms/batch)")
 
-                for thr, msg in [(500,'📉 ADE<500'),(300,'📉 ADE<300'),
-                                 (200,'🎯 ADE<200'),(150,'🏆 ADE<150'),
-                                 (100,'🌟 ADE<100!'),(50,'🔥 ADE<50km!!!')]:
-                    if ade < thr:
-                        print(f"  {msg} km"); break
+            # Milestone annotation
+            for thr, tag in ((400,'📉'),(300,'🔵'),(200,'🎯'),(150,'🏆'),(100,'🌟')):
+                if m['ADE'] < thr:
+                    print(f"  {tag}  ADE < {thr} km")
+                    break
 
-                with open(log_path, 'a') as f:
-                    f.write(f"{epoch},{avg_train:.6f},{avg_val:.6f},"
-                            f"{ade:.1f},{fde:.1f},"
-                            f"{m.get('12h',0):.1f},{m.get('24h',0):.1f},"
-                            f"{m.get('48h',0):.1f},{m.get('72h',0):.1f},"
-                            f"{args.sigma_min:.4f},{ep_time:.1f},{sms:.1f},"
-                            f"{avg_bd['fm']:.4f},{avg_bd['overall_dir']:.4f},"
-                            f"{avg_bd['step_dir']:.4f},{avg_bd['disp']:.4f},"
-                            f"{avg_bd['heading']:.4f},{avg_bd['smooth']:.4f},"
-                            f"{avg_bd['pinn']:.4f}\n")
+            print(f"{'─'*68}\n")
 
-                saver(ade, model, args.output_dir, epoch,
-                      optimizer, avg_train, avg_val)
-            else:
-                print(f"  Epoch {epoch:>3} │ train={avg_train:.4f}"
-                      f"  val={avg_val:.4f}  time={ep_time:.1f}s")
-                with open(log_path, 'a') as f:
-                    f.write(f"{epoch},{avg_train:.6f},{avg_val:.6f},"
-                            f",,,,,,"
-                            f"{args.sigma_min:.4f},{ep_time:.1f},,"
-                            f"{avg_bd['fm']:.4f},{avg_bd['overall_dir']:.4f},"
-                            f"{avg_bd['step_dir']:.4f},{avg_bd['disp']:.4f},"
-                            f"{avg_bd['heading']:.4f},{avg_bd['smooth']:.4f},"
-                            f"{avg_bd['pinn']:.4f}\n")
+            with open(log_path, 'a') as f:
+                f.write(f"{epoch},{avg_train:.6f},{avg_val:.6f},"
+                        f"{m['ADE']:.1f},{m['FDE']:.1f},"
+                        f"{m.get('12h',0):.1f},{m.get('24h',0):.1f},"
+                        f"{m.get('48h',0):.1f},{m.get('72h',0):.1f},"
+                        f"{avg_parts['fm']:.4f},{avg_parts['dir']:.4f},"
+                        f"{avg_parts['step']:.4f},{avg_parts['disp']:.4f},"
+                        f"{avg_parts['heading']:.4f},{avg_parts['smooth']:.4f},"
+                        f"{avg_parts['pinn']:.4f},"
+                        f"{ep_s:.1f},{m['ms_per_batch']:.1f}\n")
 
-            if saver.early_stop:
-                print("  Early stopping."); break
+            saver(m['ADE'], model, args.output_dir, epoch,
+                  optimizer, avg_train, avg_val)
+        else:
+            print(f"  Epoch {epoch:>3}  train={avg_train:.4f}  val={avg_val:.4f}"
+                  f"  pinn={avg_parts['pinn']:.4f}  ({ep_s:.0f}s)")
+            with open(log_path, 'a') as f:
+                f.write(f"{epoch},{avg_train:.6f},{avg_val:.6f},"
+                        f",,,,,,"
+                        f"{avg_parts['fm']:.4f},{avg_parts['dir']:.4f},"
+                        f"{avg_parts['step']:.4f},{avg_parts['disp']:.4f},"
+                        f"{avg_parts['heading']:.4f},{avg_parts['smooth']:.4f},"
+                        f"{avg_parts['pinn']:.4f},"
+                        f"{ep_s:.1f},\n")
 
+        # Periodic checkpoint
         if (epoch + 1) % args.save_interval == 0:
-            ckpt = os.path.join(args.output_dir, f'ckpt_{epoch}.pth')
+            path = os.path.join(args.output_dir, f'ckpt_ep{epoch:03d}.pth')
             torch.save({'epoch': epoch,
-                        'model_state_dict': model.state_dict()}, ckpt)
-            print(f"  ✓ Checkpoint → {ckpt}")
+                        'model_state_dict': model.state_dict()}, path)
+            print(f"  💾  Checkpoint → {path}")
 
-    # ── Final test evaluation (held-out) ──────────────────────────────────────
-    print(f"\n{'='*70}")
+        if saver.early_stop:
+            print(f"  Early stopping at epoch {epoch}.")
+            break
+
+    # ── Final test ─────────────────────────────────────────────────────────────
+    print(f"\n{'='*68}")
     print(f"  FINAL TEST  (held-out year={args.test_year})")
-    print(f"{'='*70}")
+    print(f"{'='*68}")
 
-    test_m = None
     if test_loader:
-        best_ckpt = os.path.join(args.output_dir, 'best_model.pth')
-        if os.path.exists(best_ckpt):
-            ckpt_data = torch.load(best_ckpt, map_location=device)
-            model.load_state_dict(ckpt_data['model_state_dict'])
-            print(f"  Loaded best model @ epoch {ckpt_data['epoch']}"
-                  f"  (val ADE={ckpt_data['val_ade_km']:.1f} km)")
+        best_path = os.path.join(args.output_dir, 'best_model.pth')
+        if os.path.exists(best_path):
+            ckpt = torch.load(best_path, map_location=device)
+            model.load_state_dict(ckpt['model_state_dict'])
+            print(f"  Loaded best model @ epoch {ckpt['epoch']}"
+                  f"  (val ADE={ckpt['val_ade_km']:.1f} km)")
 
-        test_m, _ = evaluate_km(model, test_loader, device,
-                                 num_ensemble=args.val_ensemble,
-                                 ddim_steps=args.ode_steps,
-                                 pred_len=args.pred_len)
-        print(f"\n  Test │ ADE={test_m['ADE']:.1f}  FDE={test_m['FDE']:.1f}"
-              f"  24h={test_m.get('24h',0):.0f}"
-              f"  48h={test_m.get('48h',0):.0f}"
-              f"  72h={test_m.get('72h',0):.0f}")
+        tm = evaluate(model, test_loader, device,
+                      num_ensemble=args.val_ensemble,
+                      ddim_steps=args.ode_steps,
+                      pred_len=args.pred_len)
 
-        with open(os.path.join(args.output_dir, 'test_results.txt'), 'w') as f:
-            f.write(f"Model           : TCFlowMatching v6 FIXED\n")
-            f.write(f"Test year       : {args.test_year}\n")
-            f.write(f"sigma_min       : {args.sigma_min}\n")
-            f.write(f"ADE (km)        : {test_m['ADE']:.1f}\n")
-            f.write(f"FDE (km)        : {test_m['FDE']:.1f}\n")
-            f.write(f"12h (km)        : {test_m.get('12h',0):.1f}\n")
-            f.write(f"24h (km)        : {test_m.get('24h',0):.1f}\n")
-            f.write(f"48h (km)        : {test_m.get('48h',0):.1f}\n")
-            f.write(f"72h (km)        : {test_m.get('72h',0):.1f}\n")
+        print(f"\n  ADE={tm['ADE']:.1f}  FDE={tm['FDE']:.1f}"
+              f"  12h={tm.get('12h',0):.0f}"
+              f"  24h={tm.get('24h',0):.0f}"
+              f"  48h={tm.get('48h',0):.0f}"
+              f"  72h={tm.get('72h',0):.0f} km")
+
+        result_path = os.path.join(args.output_dir, 'test_results.txt')
+        with open(result_path, 'w') as f:
+            f.write(f"model         : TCFlowMatching v7\n")
+            f.write(f"loss_eq       : Eq(60) FM=1.0 dir=2.0 step=0.5 disp=1.0 heading=2.0 smooth=0.2 pinn=0.5\n")
+            f.write(f"pinn          : Full BVE with ERA5 u/v850 bilinear interp (fallback: simplified BVE)\n")
+            f.write(f"sigma_min     : {args.sigma_min}\n")
+            f.write(f"test_year     : {args.test_year}\n")
+            f.write(f"ADE_km        : {tm['ADE']:.1f}\n")
+            f.write(f"FDE_km        : {tm['FDE']:.1f}\n")
+            for h in (12, 24, 48, 72):
+                f.write(f"{h}h_km         : {tm.get(f'{h}h', 0):.1f}\n")
+        print(f"\n  Results → {result_path}")
 
     avg_ep = sum(epoch_times) / len(epoch_times) if epoch_times else 0
-    print(f"\n{'='*70}")
-    print(f"  DONE")
-    print(f"  Best val ADE   : {saver.best_ade:.1f} km")
-    if test_m:
-        print(f"  Test ADE       : {test_m['ADE']:.1f} km")
-    print(f"  Avg epoch time : {avg_ep:.1f}s")
+    print(f"\n  Best val ADE   : {saver.best_ade:.1f} km")
+    print(f"  Avg epoch time : {avg_ep:.0f}s")
     print(f"  Log            : {log_path}")
-    print(f"{'='*70}\n")
+    print(f"{'='*68}\n")
 
 
 if __name__ == '__main__':
@@ -1626,5 +1606,5 @@ if __name__ == '__main__':
     np.random.seed(42)
     torch.manual_seed(42)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
     main(args)
