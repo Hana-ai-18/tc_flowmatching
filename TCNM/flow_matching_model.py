@@ -1339,9 +1339,9 @@
 # # Backward-compatibility alias
 # TCDiffusion = TCFlowMatching
 
-=====  ──────────────────────────────────────────────────────────────────────────────
-==   End of TCFlowMatching implementation
-version 19
+# =====  ──────────────────────────────────────────────────────────────────────────────
+# ==   End of TCFlowMatching implementation
+# version 19
 """
 TCNM/flow_matching_model.py  ── v7  [FIXED]
 ============================================
